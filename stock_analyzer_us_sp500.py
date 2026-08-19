@@ -1267,14 +1267,37 @@ def detect_patterns(data, pb, skip_just_broke=False):
 
 
 # ────────────────────────────────────────────────────────────────
-# Plotly 圖表：K線＋均線＋布林通道＋成交量＋MACD
+# Plotly 圖表：K線＋均線＋布林通道＋成交量＋MACD＋轉折波
 # ────────────────────────────────────────────────────────────────
+
+def build_zigzag(data, w=5):
+    """朱家泓「轉折波」：串連樞紐高低點，形成鋸齒狀轉折趨勢線"""
+    pv = pivots(data, w)
+    pts = [{"idx": i, "price": data[i]["high"], "type": "H"} for i in pv["highs"]]
+    pts += [{"idx": i, "price": data[i]["low"], "type": "L"} for i in pv["lows"]]
+    pts.sort(key=lambda p: p["idx"])
+    result = []
+    for p in pts:
+        if result and result[-1]["type"] == p["type"]:
+            # 同方向的連續樞紐點，只保留更極端者（高點取更高、低點取更低）
+            last = result[-1]
+            if (p["type"] == "H" and p["price"] > last["price"]) or (p["type"] == "L" and p["price"] < last["price"]):
+                result[-1] = p
+        else:
+            result.append(p)
+    return result
+
 
 def draw_chart(data, name):
     tail = data[-120:]
     dates = [d["date"] for d in tail]
     vol_colors = ["#ef5350" if d["close"] >= d["open"] else "#26a69a" for d in tail]
     hist_colors = ["#ef5350" if (d["macdHist"] or 0) >= 0 else "#26a69a" for d in tail]
+
+    tail_start_idx = len(data) - len(tail)
+    zz = [p for p in build_zigzag(data) if p["idx"] >= tail_start_idx]
+    zz_x = [data[p["idx"]]["date"] for p in zz]
+    zz_y = [p["price"] for p in zz]
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.56, 0.22, 0.22], vertical_spacing=0.03)
 
@@ -1289,6 +1312,10 @@ def draw_chart(data, name):
                                ("ma20", "#2196f3", "MA20"), ("ma60", "#9c27b0", "MA60")]:
         fig.add_trace(go.Scatter(x=dates, y=[d[key] for d in tail], name=label,
                                   line=dict(color=color, width=1.2)), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=zz_x, y=zz_y, name="轉折波", mode="lines+markers",
+                              line=dict(color="#00e5ff", width=1.8),
+                              marker=dict(size=5, color="#00e5ff")), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=dates, y=[d["bbU"] for d in tail], name="BB上軌",
                               line=dict(color="rgba(100,200,255,.4)", width=1, dash="dot"),
