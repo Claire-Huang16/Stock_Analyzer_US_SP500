@@ -911,23 +911,44 @@ def check_pullback_buy(data):
     results = []
     all_pass = True
 
-    pv = pivots(data)
+    # 轉折波（跟型態辨識、圖表轉折波用同一套 build_zigzag，不再用另一套獨立的分形判斷法）
+    zz = build_zigzag(data)
+    zz_highs = [p for p in zz if p["type"] == "H"]
+    zz_lows = [p for p in zz if p["type"] == "L"]
+
+    # ── 條件1：趨勢多頭（轉折波 高高低低）──
     c1 = False
-    if len(pv["highs"]) >= 2 and len(pv["lows"]) >= 2:
-        rh = [data[pv["highs"][-2]]["high"], data[pv["highs"][-1]]["high"]]
-        rl = [data[pv["lows"][-2]]["low"], data[pv["lows"][-1]]["low"]]
+    if len(zz_highs) >= 2 and len(zz_lows) >= 2:
+        rh = [zz_highs[-2]["price"], zz_highs[-1]["price"]]
+        rl = [zz_lows[-2]["price"], zz_lows[-1]["price"]]
         c1 = rh[1] > rh[0] and rl[1] > rl[0]
     results.append({"label": "①趨勢多頭（高高低低）", "pass": c1, "required": True, "detail": ""})
     if not c1:
         all_pass = False
 
+    # ── 條件2：位置回後上漲（前1~5日曾出現縮量回檔，今日反彈）──
+    # 依課程講義：回檔幅度用費波那契回檔比例分級，回檔愈淺（愈接近0.382）代表股票愈強，
+    # 愈要把握機會進場；回檔愈深（接近或超過0.618）力道愈弱。
     pullback_days = data[-6:-1]
     had_pullback = any(
         (d["close"] < (pullback_days[i - 1]["close"] if i > 0 else d["close"])) or (d["close"] < d["open"])
         for i, d in enumerate(pullback_days)
     )
     c2 = had_pullback and last["close"] > prev["close"]
-    results.append({"label": "②位置回後上漲（近期有回檔，今轉上）", "pass": c2, "required": True, "detail": ""})
+    pullback_detail = ""
+    if zz_highs:
+        peak_point = zz_highs[-1]
+        prior_low_cands = [p for p in zz_lows if p["idx"] < peak_point["idx"]]
+        if prior_low_cands:
+            prior_low = prior_low_cands[-1]["price"]
+            peak = peak_point["price"]
+            if peak > prior_low:
+                pullback_segment = data[peak_point["idx"]:]
+                pullback_low = min(d["low"] for d in pullback_segment)
+                retrace = (peak - pullback_low) / (peak - prior_low)
+                grade = "最強" if retrace <= 0.382 else "強" if retrace <= 0.5 else "弱" if retrace <= 0.618 else "回檔過深"
+                pullback_detail = f"回檔幅度{retrace * 100:.1f}%（{grade}，費波0.382/0.5/0.618分級）"
+    results.append({"label": "②位置回後上漲（近期有回檔，今轉上）", "pass": c2, "required": True, "detail": pullback_detail})
     if not c2:
         all_pass = False
 
@@ -1000,6 +1021,12 @@ def _ma_slope_up(data, key, n, last_idx):
 
 
 def detect_patterns(data, pb, skip_just_broke=False):
+    # 型態辨識固定只看「跟圖表顯示範圍一致」的最近120根K棒，並套用同一套壞資料過濾規則，
+    # 確保型態辨識用的轉折波，跟圖表上實際畫出來的轉折波／輔助線是同一組資料算出來的結果
+    # ——否則用全部歷史資料算出的轉折點，可能跟圖表只用最近120根算出的轉折點對不起來。
+    data = [d for d in data[-120:] if d.get("open", 0) > 0 and d.get("high", 0) > 0
+            and d.get("low", 0) > 0 and d.get("close", 0) > 0
+            and all(_is_finite(d[k]) for k in ("open", "high", "low", "close"))]
     last = len(data) - 1
     last_close = data[last]["close"]
     last_vol = data[last]["volume"]
@@ -1010,8 +1037,10 @@ def detect_patterns(data, pb, skip_just_broke=False):
     # 不再用另一套獨立的分形視窗判斷法——這樣圖表上畫出來的轉折波，就是型態辨識實際依據的高低點，
     # 兩者完全一致，不會有「圖上看到的轉折」跟「型態判斷用的轉折」對不起來的狀況。
     zz = build_zigzag(data)
-    # 只取近90根K棒內的轉折點，避免抓到太久遠、失去意義的型態
-    floor = max(0, len(data) - 90)
+    # 型態辨識用的轉折點範圍，直接沿用整個(已限制在120根K棒內的)資料範圍，跟圖表顯示範圍完全一致，
+    # 不再另外疊加一層90天子視窗限制——避免「圖表上看得到的高低點」卻被排除在型態判斷之外，
+    # 導致畫出來的頸線/壓力線跟圖上真正的高低點對不起來。
+    floor = 0
     lows = [p["idx"] for p in zz if p["type"] == "L" and floor <= p["idx"] < last]
     highs = [p["idx"] for p in zz if p["type"] == "H" and floor <= p["idx"] < last]
 
@@ -1025,7 +1054,7 @@ def detect_patterns(data, pb, skip_just_broke=False):
 
     results = []
 
-    # (1) 頭肩底
+    # (1) 頭肩底：右肩不破 頭→頸線 1/2（依課程講義）
     id_, name = "hs", "頭肩底"
     added = False
     if len(lows) >= 3:
@@ -1036,16 +1065,19 @@ def detect_patterns(data, pb, skip_just_broke=False):
         if shoulders_similar and head_lower:
             h_between = [i for i in highs if l3[0] < i < l3[2]]
             neck = max((data[i]["high"] for i in h_between), default=None)
-            bo = breakout_check(neck)
-            results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "左右肩低點相近，頭部最低，突破頸線為買點",
-                             "line": {"i1": l3[0], "p1": neck, "slope": 0} if neck is not None else None})
-            added = True
+            # 依課程講義：右肩(L3)不能跌破 頭(L2)→頸線 漲幅的 1/2，才是有效的右肩（不是單純比頭高就好）
+            valid_right_shoulder = neck is not None and L3v > (L2 + neck) / 2
+            if valid_right_shoulder:
+                bo = breakout_check(neck)
+                results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
+                                 "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "左右肩低點相近，頭部最低，右肩不破1/2，突破頸線為買點",
+                                 "line": {"i1": l3[0], "p1": neck, "slope": 0}})
+                added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "左右肩低點相近，頭部最低，突破頸線為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "左右肩低點相近，頭部最低，右肩不破1/2，突破頸線為買點"})
 
-    # (2) 複式頭肩底
+    # (2) 複式頭肩底：最近肩部不破 頭→頸線 1/2（依課程講義）
     id_, name = "chs", "複式頭肩底"
     added = False
     if len(lows) >= 4:
@@ -1062,36 +1094,45 @@ def detect_patterns(data, pb, skip_just_broke=False):
         if shoulders_ok:
             h_between = [i for i in highs if last_lows[0] < i < last_lows[-1]]
             neck = max((data[i]["high"] for i in h_between), default=None)
-            bo = breakout_check(neck)
-            results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "多重肩部低點環繞單一最低頭部，突破頸線為買點",
-                             "line": {"i1": last_lows[0], "p1": neck, "slope": 0} if neck is not None else None})
-            added = True
+            # 依課程講義：最近（最右）一個肩部不能跌破 頭→頸線 漲幅的 1/2
+            last_shoulder_val = low_vals[-1]
+            valid_last_shoulder = neck is not None and last_shoulder_val > (min_val + neck) / 2
+            if valid_last_shoulder:
+                bo = breakout_check(neck)
+                results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
+                                 "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "多重肩部低點環繞單一最低頭部，最近肩部不破1/2，突破頸線為買點",
+                                 "line": {"i1": last_lows[0], "p1": neck, "slope": 0}})
+                added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "多重肩部低點環繞單一最低頭部，突破頸線為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "多重肩部低點環繞單一最低頭部，最近肩部不破1/2，突破頸線為買點"})
 
-    # (3) N字底
+    # (3) N字底：依課程講義，拉回不破 A→B 漲幅的 1/2 才是有效的淺拉回
     id_, name = "nb", "N字底"
     added = False
     if len(lows) >= 2 and len(highs) >= 1:
         A, C = lows[-2], lows[-1]
         b_cands = [i for i in highs if A < i < C]
         if b_cands:
-            B = b_cands[-1]
+            # 取A、C之間「最高」的確認高點，而不是「最近」的一個——
+            # 若下跌過程中出現次要反彈小高點，會比真正的主高點更晚被確認，
+            # 用「最近」選到的話會抓到錯誤（偏低）的壓力位置。
+            B = max(b_cands, key=lambda i: data[i]["high"])
             low_a, low_c, high_b = data[A]["low"], data[C]["low"], data[B]["high"]
-            higher_low = low_c > low_a
-            if higher_low:
+            # 依課程講義：C（拉回低點）不能跌破 A→B 漲幅的 1/2，才是有效的淺拉回（不是單純比A高就好）
+            half_point = (low_a + high_b) / 2
+            shallow_pullback = low_c > half_point
+            if shallow_pullback:
                 bo = breakout_check(high_b)
                 results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                                 "detail": bo["detail"] or "拉回未破前低，等待突破反彈高點", "desc": "低點反彈後拉回不破前低，再突破反彈高點為買點",
+                                 "detail": bo["detail"] or f"拉回未破1/2（{half_point:.2f}），等待突破反彈高點", "desc": "低點反彈後拉回不破1/2，再突破反彈高點為買點",
                                  "line": {"i1": B, "p1": high_b, "slope": 0}})
                 added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "低點反彈後拉回不破前低，再突破反彈高點為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "低點反彈後拉回不破1/2，再突破反彈高點為買點"})
 
-    # (4) 三重底
+    # (4) 三重底：三個相近低點，兩個中間高點也要相近（形成真正的水平頸線）
     id_, name = "tb", "三重底"
     added = False
     if len(lows) >= 3:
@@ -1099,16 +1140,22 @@ def detect_patterns(data, pb, skip_just_broke=False):
         vals = [data[i]["low"] for i in l3]
         all_similar = tolerant(vals[0], vals[1], 0.08) and tolerant(vals[1], vals[2], 0.08) and tolerant(vals[0], vals[2], 0.08)
         if all_similar:
-            h_between = [i for i in highs if l3[0] < i < l3[2]]
-            res = max((data[i]["high"] for i in h_between), default=None)
-            bo = breakout_check(res)
-            results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破壓力", "desc": "三個低點高度相近，突破期間高點為買點",
-                             "line": {"i1": l3[0], "p1": res, "slope": 0} if res is not None else None})
-            added = True
+            h_between1 = [i for i in highs if l3[0] < i < l3[1]]
+            h_between2 = [i for i in highs if l3[1] < i < l3[2]]
+            peak1 = max((data[i]["high"] for i in h_between1), default=None)
+            peak2 = max((data[i]["high"] for i in h_between2), default=None)
+            # 依課程講義：兩個中間高點要相近，才是真正的水平頸線（不是隨便夾兩個高低不一的高點）
+            neckline_ok = peak1 is not None and peak2 is not None and tolerant(peak1, peak2, 0.05)
+            if neckline_ok:
+                res = max(peak1, peak2)
+                bo = breakout_check(res)
+                results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
+                                 "detail": bo["detail"] or "型態成形，等待突破壓力", "desc": "三個低點高度相近，中間兩高點形成水平頸線，突破頸線為買點",
+                                 "line": {"i1": l3[0], "p1": res, "slope": 0}})
+                added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "三個低點高度相近，突破期間高點為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "三個低點高度相近，中間兩高點形成水平頸線，突破頸線為買點"})
 
     # (5) 圓弧底
     id_, name = "rb", "圓弧底"
@@ -1139,8 +1186,11 @@ def detect_patterns(data, pb, skip_just_broke=False):
             resistance = max(d["high"] for d in first)
             bo = breakout_check(resistance)
             win_start_idx = len(data) - len(win)
+            # 依課程講義：目標價 = 突破點 + 型態高度（起跌點高點 - 最低點），即測量移動法
+            target = resistance + (resistance - mid_low)
             results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "弧形築底中，等待突破起跌壓力", "desc": "價格緩跌後緩升成U型，突破起跌點高點為買點",
+                             "detail": (bo["detail"] or "弧形築底中，等待突破起跌壓力") + f"　目標價≈{target:.2f}",
+                             "desc": "價格緩跌後緩升成U型，突破起跌點高點為買點",
                              "line": {"i1": win_start_idx, "p1": resistance, "slope": 0}})
             added = True
     if not added:
@@ -1169,8 +1219,10 @@ def detect_patterns(data, pb, skip_just_broke=False):
             above_all_ma = all(v is not None and last_close > v for v in last4)
             breakout = last_close > resistance and above_all_ma and vol_confirm
             win_start_idx6 = len(data) - N - 1
+            # 依課程講義：目標價 = 突破點 + 型態高度（整理區間高點 - 整理區間低點）
+            target6 = resistance + (resistance - win_low)
             results.append({"id": id_, "name": name, "formed": True, "breakout": breakout,
-                             "detail": f"整理區間高點＝{resistance:.2f}　現價＝{last_close:.2f}" + ("　(帶量突破)" if vol_confirm else "　(尚未帶量)"),
+                             "detail": f"整理區間高點＝{resistance:.2f}　現價＝{last_close:.2f}" + ("　(帶量突破)" if vol_confirm else "　(尚未帶量)") + f"　目標價≈{target6:.2f}",
                              "desc": "均線糾結、價格窄幅整理（區間範圍約10%內），帶量突破整理區間為買點",
                              "line": {"i1": win_start_idx6, "p1": resistance, "slope": 0}})
             added = True
@@ -1203,7 +1255,7 @@ def detect_patterns(data, pb, skip_just_broke=False):
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點"})
 
-    # (8) 突破上升軌道線
+    # (8) 突破上升軌道線：軌道線要有至少2個高點貼著同一條平行線才算數（依課程講義）
     id_, name = "channel", "突破上升軌道線"
     added = False
     floor2 = max(0, len(data) - 60)
@@ -1214,8 +1266,20 @@ def detect_patterns(data, pb, skip_just_broke=False):
         ly1, ly2 = data[l1]["low"], data[l2]["low"]
         if ly2 > ly1 and l2 > l1:
             slope2 = (ly2 - ly1) / (l2 - l1)
-            offsets = [data[i]["high"] - (ly1 + slope2 * (i - l1)) for i in highs_in if i > l1]
-            offset = max(offsets) if offsets else None
+            offset_cands = [data[i]["high"] - (ly1 + slope2 * (i - l1)) for i in highs_in if i > l1]
+            # 依課程講義：上升軌道線要有「至少2個高點」貼著同一條平行線，才是真正的軌道線
+            # （不能只是單一個高點恰好離支撐線最遠，那只是巧合，不是真的通道）
+            # 容忍度用股價的3%來算（而不是用offset自身的百分比），避免offset數值太小時誤判過嚴
+            offset = None
+            if len(offset_cands) >= 2:
+                tol = last_close * 0.03
+                best_offset, best_count = None, 0
+                for o in offset_cands:
+                    count = sum(1 for o2 in offset_cands if abs(o - o2) <= tol)
+                    if count > best_count or (count == best_count and (best_offset is None or o > best_offset)):
+                        best_count, best_offset = count, o
+                if best_count >= 2:
+                    offset = best_offset
             if offset is not None and offset > 0:
                 upper_at_last = ly1 + slope2 * (last - l1) + offset
                 ma20up2 = _ma_slope_up(data, "ma20", 10, last)
@@ -1255,27 +1319,36 @@ def detect_patterns(data, pb, skip_just_broke=False):
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "飆股急漲後出現大量黑K回檔，3日內帶量長紅突破其最高點為買點"})
 
-    # (10) K線橫盤的突破：三天(含首日)收盤未突破/跌破首日K線高低點，第四天(今日)帶量突破首日高點為買點
+    # (10) K線橫盤的突破：三天以上(含首日)收盤未突破/跌破首日K線高低點，帶量突破首日高點為買點
     id_, name = "kbp", "K線橫盤的突破"
     added = False
     if len(data) >= 4:
-        anchor = data[last - 3]
-        d2, d3 = data[last - 2], data[last - 1]
-
-        def in_range(d):
-            return anchor["low"] <= d["close"] <= anchor["high"]
-
-        if in_range(d2) and in_range(d3):
+        anchor_idx = last - 3  # 最小需求：3天(含首日)
+        anchor_bar = data[anchor_idx]
+        min_ok = all(anchor_bar["low"] <= data[j]["close"] <= anchor_bar["high"] for j in range(anchor_idx + 1, last))
+        if min_ok:
+            # 課本圖上的橫盤區間常常不只3天——只要收盤價持續守在「首日K線」的高低範圍內，
+            # 就往前延伸找到最早、仍然成立的起點，涵蓋較長的橫盤整理段。
+            max_lookback = 20
+            candidate = anchor_idx - 1
+            while candidate >= 0 and (last - candidate) <= max_lookback:
+                in_range = all(data[candidate]["low"] <= data[k]["close"] <= data[candidate]["high"]
+                                for k in range(candidate + 1, last))
+                if not in_range:
+                    break
+                anchor_idx = candidate
+                candidate -= 1
+            anchor = data[anchor_idx]
             is_red_k = data[last]["close"] > data[last]["open"]
             breakout_k = last_close > anchor["high"] and is_red_k and vol_confirm
             results.append({"id": id_, "name": name, "formed": True, "breakout": breakout_k,
-                             "detail": f"首日K線高點＝{anchor['high']:.2f}　現價＝{last_close:.2f}" + ("　(帶量)" if vol_confirm else "　(量未放大)"),
-                             "desc": "三天(含首日)收盤未突破首日K線高低點，第四天帶量紅K突破首日高點為買點",
-                             "line": {"i1": last - 3, "p1": anchor["high"], "slope": 0}})
+                             "detail": f"首日K線高點＝{anchor['high']:.2f}　整理天數＝{last - anchor_idx}天　現價＝{last_close:.2f}" + ("　(帶量)" if vol_confirm else "　(量未放大)"),
+                             "desc": "三天以上(含首日)收盤未突破首日K線高低點，帶量紅K突破首日高點為買點",
+                             "line": {"i1": anchor_idx, "p1": anchor["high"], "slope": 0}})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "三天(含首日)收盤未突破首日K線高低點，第四天帶量紅K突破首日高點為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "三天以上(含首日)收盤未突破首日K線高低點，帶量紅K突破首日高點為買點"})
 
     # (11) 回後買上漲：沿用 checkPullbackBuy() 判斷結果
     if pb:
@@ -1393,7 +1466,6 @@ def build_zigzag(data):
 
 def draw_chart(data, name, pt=None):
     raw_tail = data[-120:]
-    tail_start_idx = len(data) - len(raw_tail)
     # 過濾掉資料異常的K棒（開高低收有任一項是 0、負值或非數字），
     # 避免圖表出現「沒有K棒的空白位置」卻仍有轉折波或均線的線硬穿過去
     tail = [d for d in raw_tail if d.get("open", 0) > 0 and d.get("high", 0) > 0
@@ -1422,7 +1494,7 @@ def draw_chart(data, name, pt=None):
         "kbp": {"color": "rgba(255,255,255,.85)", "label": "K線橫盤首日高點"},
     }
     shapes, annotations = [], []
-    last_idx = len(data) - 1
+    last_idx = len(tail) - 1
     if pt and pt.get("results"):
         for p in pt["results"]:
             if not p.get("formed"):
@@ -1432,25 +1504,25 @@ def draw_chart(data, name, pt=None):
                 continue
             # 上升軌道線另外多畫一條下緣支撐線（line2），其餘型態只有一條輔助線（line）
             for idx, ln in enumerate((p.get("line"), p.get("line2"))):
-                if not ln or ln["i1"] < tail_start_idx:
+                if not ln or ln["i1"] < 0 or ln["i1"] >= len(tail):
                     continue
                 line_end_price = ln["p1"] + ln["slope"] * (last_idx - ln["i1"])
                 shapes.append(dict(
                     type="line", xref="x", yref="y",
-                    x0=data[ln["i1"]]["date"], y0=ln["p1"],
-                    x1=data[last_idx]["date"], y1=line_end_price,
+                    x0=tail[ln["i1"]]["date"], y0=ln["p1"],
+                    x1=tail[last_idx]["date"], y1=line_end_price,
                     line=dict(color=style["color"], width=2 if idx == 0 else 1.3,
                                dash="solid" if p["breakout"] else "dash"),
                 ))
                 if idx == 0:
                     annotations.append(dict(
-                        x=data[ln["i1"]]["date"], y=ln["p1"], xref="x", yref="y",
+                        x=tail[ln["i1"]]["date"], y=ln["p1"], xref="x", yref="y",
                         text=style["label"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
                         font=dict(color=style["color"], size=10), ax=-10, ay=-30,
                     ))
                     if p["breakout"]:
                         annotations.append(dict(
-                            x=data[last_idx]["date"], y=data[last_idx]["close"], xref="x", yref="y",
+                            x=tail[last_idx]["date"], y=tail[last_idx]["close"], xref="x", yref="y",
                             text="★ 突破" + p["name"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
                             font=dict(color=style["color"], size=11), ax=10, ay=-35,
                         ))
