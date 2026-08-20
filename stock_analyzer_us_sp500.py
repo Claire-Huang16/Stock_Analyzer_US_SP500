@@ -4,7 +4,7 @@ US技術分析全攻略 · 美股評分分析系統 (Streamlit 版)
 由 stock_analyzer_us.html 轉換而成，邏輯與原 HTML/JS 版本一致：
 - 朱家泓四維度評分（趨勢／K線／均線／成交量，各25分，共100分），套用於美股個股分析
 - 回後買上漲 8 條件核對
-- 10 種進場型態確認（含「剛突破」：與前一交易日比較的新鮮突破訊號）
+- 11 種進場型態確認（含「剛突破」：與前一交易日比較的新鮮突破訊號）
 - 批次分析摘要表（可依進場條件／評分／型態確認篩選，關鍵字搜尋）
 - Plotly K線＋均線＋布林通道＋成交量＋MACD 圖表
 - OpenAI API「AI 智能綜合分析」
@@ -536,7 +536,7 @@ SP500_NAMES = {
     'ZTS': 'Zoetis'
 }
 
-MY_LIST = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AVGO', 'JPM', 'LLY']
+MY_LIST = ['AXTI', 'LITE', 'COHR', 'RCAT', 'LWLG', 'UMC', 'AMKR', 'AEHR', 'ON', 'SMR', 'IREN', 'HIMX', 'TSEM', 'CRDO', 'PLTR', 'BABA', 'HOOD', 'ALAB', 'NVDA', 'MU', 'FTNT', 'AEX', 'OXY', 'MRVL', 'QCOM', 'XYZ', 'RKLB', 'FN', 'ORCL', 'AVGO', 'BE', 'CRWV', 'AMD', 'SHOP', 'VZ', 'OWL', 'TER', 'GOOGL', 'SMCI', 'QBTS', 'VRT', 'TSM', 'SNDK', 'ONDS', 'RCAT', 'NBIS', 'POET', 'TSEM', 'GLW', 'DELL', 'SPCX', 'ON', 'SMTC']
 
 
 # ────────────────────────────────────────────────────────────────
@@ -601,7 +601,7 @@ def fetch_company_name(token: str, stock_id: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────────
-# 技術指標計算、朱家泓四維度評分、回後買上漲、10種進場型態、Plotly 圖表
+# 技術指標計算、朱家泓四維度評分、回後買上漲、11種進場型態、Plotly 圖表
 # （與台股版邏輯完全一致，方法論本身與市場無關）
 # ────────────────────────────────────────────────────────────────
 def calc_ma(closes, p):
@@ -1006,10 +1006,14 @@ def detect_patterns(data, pb, skip_just_broke=False):
     vm20 = data[last]["vm20"]
     vol_confirm = (last_vol / vm20 >= 1.3) if vm20 else False
 
-    pv = pivots(data, 4)
+    # 型態辨識所用的高低點，改成直接沿用「轉折波」(build_zigzag) 算出來的同一組轉折點，
+    # 不再用另一套獨立的分形視窗判斷法——這樣圖表上畫出來的轉折波，就是型態辨識實際依據的高低點，
+    # 兩者完全一致，不會有「圖上看到的轉折」跟「型態判斷用的轉折」對不起來的狀況。
+    zz = build_zigzag(data)
+    # 只取近90根K棒內的轉折點，避免抓到太久遠、失去意義的型態
     floor = max(0, len(data) - 90)
-    lows = [i for i in pv["lows"] if floor <= i < last]
-    highs = [i for i in pv["highs"] if floor <= i < last]
+    lows = [p["idx"] for p in zz if p["type"] == "L" and floor <= p["idx"] < last]
+    highs = [p["idx"] for p in zz if p["type"] == "H" and floor <= p["idx"] < last]
 
     def breakout_check(resistance):
         if resistance is None:
@@ -1034,7 +1038,8 @@ def detect_patterns(data, pb, skip_just_broke=False):
             neck = max((data[i]["high"] for i in h_between), default=None)
             bo = breakout_check(neck)
             results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "左右肩低點相近，頭部最低，突破頸線為買點"})
+                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "左右肩低點相近，頭部最低，突破頸線為買點",
+                             "line": {"i1": l3[0], "p1": neck, "slope": 0} if neck is not None else None})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
@@ -1059,7 +1064,8 @@ def detect_patterns(data, pb, skip_just_broke=False):
             neck = max((data[i]["high"] for i in h_between), default=None)
             bo = breakout_check(neck)
             results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "多重肩部低點環繞單一最低頭部，突破頸線為買點"})
+                             "detail": bo["detail"] or "型態成形，等待突破頸線", "desc": "多重肩部低點環繞單一最低頭部，突破頸線為買點",
+                             "line": {"i1": last_lows[0], "p1": neck, "slope": 0} if neck is not None else None})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
@@ -1078,7 +1084,8 @@ def detect_patterns(data, pb, skip_just_broke=False):
             if higher_low:
                 bo = breakout_check(high_b)
                 results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                                 "detail": bo["detail"] or "拉回未破前低，等待突破反彈高點", "desc": "低點反彈後拉回不破前低，再突破反彈高點為買點"})
+                                 "detail": bo["detail"] or "拉回未破前低，等待突破反彈高點", "desc": "低點反彈後拉回不破前低，再突破反彈高點為買點",
+                                 "line": {"i1": B, "p1": high_b, "slope": 0}})
                 added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
@@ -1096,7 +1103,8 @@ def detect_patterns(data, pb, skip_just_broke=False):
             res = max((data[i]["high"] for i in h_between), default=None)
             bo = breakout_check(res)
             results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "型態成形，等待突破壓力", "desc": "三個低點高度相近，突破期間高點為買點"})
+                             "detail": bo["detail"] or "型態成形，等待突破壓力", "desc": "三個低點高度相近，突破期間高點為買點",
+                             "line": {"i1": l3[0], "p1": res, "slope": 0} if res is not None else None})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
@@ -1130,14 +1138,16 @@ def detect_patterns(data, pb, skip_just_broke=False):
         if shape_ok and low_vol:
             resistance = max(d["high"] for d in first)
             bo = breakout_check(resistance)
+            win_start_idx = len(data) - len(win)
             results.append({"id": id_, "name": name, "formed": True, "breakout": bo["confirmed"],
-                             "detail": bo["detail"] or "弧形築底中，等待突破起跌壓力", "desc": "價格緩跌後緩升成U型，突破起跌點高點為買點"})
+                             "detail": bo["detail"] or "弧形築底中，等待突破起跌壓力", "desc": "價格緩跌後緩升成U型，突破起跌點高點為買點",
+                             "line": {"i1": win_start_idx, "p1": resistance, "slope": 0}})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "價格緩跌後緩升成U型，突破起跌點高點為買點"})
 
-    # (6) 一字底（均線糾結）
+    # (6) 一字底（均線糾結）：整理區間範圍約10%內（依課程講義定義）
     id_, name = "fb", "一字底(均線糾結)"
     added = False
     N = 10
@@ -1146,44 +1156,49 @@ def detect_patterns(data, pb, skip_just_broke=False):
     if ok:
         tangled = all(
             (max(d["ma5"], d["ma10"], d["ma20"], d["ma60"]) - min(d["ma5"], d["ma10"], d["ma20"], d["ma60"]))
-            / min(d["ma5"], d["ma10"], d["ma20"], d["ma60"]) <= 0.035
+            / min(d["ma5"], d["ma10"], d["ma20"], d["ma60"]) <= 0.05
             for d in win
         )
-        narrow_range = all((d["high"] - d["low"]) / d["close"] <= 0.045 for d in win)
+        # 課程講義定義：整理區間範圍（整段最高與最低價的差距）約在 10% 以內，才算「一字底」
+        win_high = max(d["high"] for d in win)
+        win_low = min(d["low"] for d in win)
+        narrow_range = (win_high - win_low) / win_low <= 0.10
         if tangled and narrow_range:
-            resistance = max(d["high"] for d in win)
+            resistance = win_high
             last4 = [data[last]["ma5"], data[last]["ma10"], data[last]["ma20"], data[last]["ma60"]]
             above_all_ma = all(v is not None and last_close > v for v in last4)
             breakout = last_close > resistance and above_all_ma and vol_confirm
+            win_start_idx6 = len(data) - N - 1
             results.append({"id": id_, "name": name, "formed": True, "breakout": breakout,
                              "detail": f"整理區間高點＝{resistance:.2f}　現價＝{last_close:.2f}" + ("　(帶量突破)" if vol_confirm else "　(尚未帶量)"),
-                             "desc": "均線糾結、價格窄幅整理，帶量突破整理區間為買點"})
+                             "desc": "均線糾結、價格窄幅整理（區間範圍約10%內），帶量突破整理區間為買點",
+                             "line": {"i1": win_start_idx6, "p1": resistance, "slope": 0}})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "均線糾結、價格窄幅整理，帶量突破整理區間為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "均線糾結、價格窄幅整理（區間範圍約10%內），帶量突破整理區間為買點"})
 
     # (7) 突破ABC修正下降切線
     id_, name = "abc", "突破ABC修正下降切線"
     added = False
-    win_floor = max(0, len(data) - 60)
-    highs_in_win = [i for i in highs if i >= win_floor]
-    if highs_in_win:
-        start_idx = highs_in_win[0]
-        corr_highs = [i for i in highs_in_win if start_idx < i <= start_idx + 20]
-        if len(corr_highs) >= 2:
-            h1, h2 = corr_highs[0], corr_highs[-1]
-            y1, y2 = data[h1]["high"], data[h2]["high"]
-            if y2 < y1 and h2 > h1:
-                slope_ = (y2 - y1) / (h2 - h1)
-                line_at_last = y1 + slope_ * (last - h1)
-                ma20up = _ma_slope_up(data, "ma20", 10, last)
-                is_red = data[last]["close"] > data[last]["open"]
-                breakout = last_close > line_at_last and ma20up and is_red
-                results.append({"id": id_, "name": name, "formed": True, "breakout": breakout,
-                                 "detail": f"下降切線位置≈{line_at_last:.2f}　現價＝{last_close:.2f}" + ("　MA20上揚" if ma20up else "　MA20未上揚"),
-                                 "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點"})
-                added = True
+    # 只看「最近」的轉折高點，取最後兩個（A、C），避免抓到太久遠、已經沒有參考意義的舊高點
+    recent_highs = [i for i in highs if i >= last - 40]
+    if len(recent_highs) >= 2:
+        h1, h2 = recent_highs[-2], recent_highs[-1]  # A：較早較高；C：較近較低
+        y1, y2 = data[h1]["high"], data[h2]["high"]
+        # A、C之間要有拉回的低點（確認是ABC三段式修正），C要比A低，且間隔/時效合理
+        has_low_between = any(h1 < li < h2 for li in lows)
+        if y2 < y1 and h2 > h1 and has_low_between and (h2 - h1) <= 20 and (last - h2) <= 20:
+            slope_ = (y2 - y1) / (h2 - h1)
+            line_at_last = y1 + slope_ * (last - h1)
+            ma20up = _ma_slope_up(data, "ma20", 10, last)
+            is_red = data[last]["close"] > data[last]["open"]
+            breakout = last_close > line_at_last and ma20up and is_red
+            results.append({"id": id_, "name": name, "formed": True, "breakout": breakout,
+                             "detail": f"下降切線位置≈{line_at_last:.2f}　現價＝{last_close:.2f}" + ("　MA20上揚" if ma20up else "　MA20未上揚"),
+                             "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點",
+                             "line": {"i1": h1, "p1": y1, "i2": h2, "p2": y2, "slope": slope_}})
+            added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點"})
@@ -1208,7 +1223,9 @@ def detect_patterns(data, pb, skip_just_broke=False):
                 breakout2 = last_close > upper_at_last and ma20up2 and is_red2 and vol_confirm
                 results.append({"id": id_, "name": name, "formed": True, "breakout": breakout2,
                                  "detail": f"軌道上緣≈{upper_at_last:.2f}　現價＝{last_close:.2f}" + ("　帶量" if vol_confirm else "　量未放大"),
-                                 "desc": "股價沿上升軌道緩步上漲，MA20上揚下帶量長紅收盤突破軌道上緣為買點"})
+                                 "desc": "股價沿上升軌道緩步上漲，MA20上揚下帶量長紅收盤突破軌道上緣為買點",
+                                 "line": {"i1": l1, "p1": ly1 + offset, "slope": slope2},
+                                 "line2": {"i1": l1, "p1": ly1, "slope": slope2}})
                 added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
@@ -1231,13 +1248,36 @@ def detect_patterns(data, pb, skip_just_broke=False):
             breakout3 = last_close > bk_high and is_red3 and vol_confirm and ma20up3
             results.append({"id": id_, "name": name, "formed": True, "breakout": breakout3,
                              "detail": f"大量黑K高點＝{bk_high:.2f}　現價＝{last_close:.2f}" + ("　帶量" if vol_confirm else "　量未放大"),
-                             "desc": "飆股急漲後出現大量黑K回檔，3日內帶量長紅突破其最高點為買點"})
+                             "desc": "飆股急漲後出現大量黑K回檔，3日內帶量長紅突破其最高點為買點",
+                             "line": {"i1": bk_idx, "p1": bk_high, "slope": 0}})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "飆股急漲後出現大量黑K回檔，3日內帶量長紅突破其最高點為買點"})
 
-    # (10) 回後買上漲：沿用 checkPullbackBuy() 判斷結果
+    # (10) K線橫盤的突破：三天(含首日)收盤未突破/跌破首日K線高低點，第四天(今日)帶量突破首日高點為買點
+    id_, name = "kbp", "K線橫盤的突破"
+    added = False
+    if len(data) >= 4:
+        anchor = data[last - 3]
+        d2, d3 = data[last - 2], data[last - 1]
+
+        def in_range(d):
+            return anchor["low"] <= d["close"] <= anchor["high"]
+
+        if in_range(d2) and in_range(d3):
+            is_red_k = data[last]["close"] > data[last]["open"]
+            breakout_k = last_close > anchor["high"] and is_red_k and vol_confirm
+            results.append({"id": id_, "name": name, "formed": True, "breakout": breakout_k,
+                             "detail": f"首日K線高點＝{anchor['high']:.2f}　現價＝{last_close:.2f}" + ("　(帶量)" if vol_confirm else "　(量未放大)"),
+                             "desc": "三天(含首日)收盤未突破首日K線高低點，第四天帶量紅K突破首日高點為買點",
+                             "line": {"i1": last - 3, "p1": anchor["high"], "slope": 0}})
+            added = True
+    if not added:
+        results.append({"id": id_, "name": name, "formed": False, "breakout": False,
+                         "detail": "尚未偵測到符合結構", "desc": "三天(含首日)收盤未突破首日K線高低點，第四天帶量紅K突破首日高點為買點"})
+
+    # (11) 回後買上漲：沿用 checkPullbackBuy() 判斷結果
     if pb:
         pb_formed = pb["allPass"] or pb["requiredPassed"] >= pb["requiredTotal"] - 1
         results.append({
@@ -1270,34 +1310,150 @@ def detect_patterns(data, pb, skip_just_broke=False):
 # Plotly 圖表：K線＋均線＋布林通道＋成交量＋MACD＋轉折波
 # ────────────────────────────────────────────────────────────────
 
-def build_zigzag(data, w=5):
-    """朱家泓「轉折波」：串連樞紐高低點，形成鋸齒狀轉折趨勢線"""
-    pv = pivots(data, w)
-    pts = [{"idx": i, "price": data[i]["high"], "type": "H"} for i in pv["highs"]]
-    pts += [{"idx": i, "price": data[i]["low"], "type": "L"} for i in pv["lows"]]
-    pts.sort(key=lambda p: p["idx"])
-    result = []
-    for p in pts:
-        if result and result[-1]["type"] == p["type"]:
-            # 同方向的連續樞紐點，只保留更極端者（高點取更高、低點取更低）
-            last = result[-1]
-            if (p["type"] == "H" and p["price"] > last["price"]) or (p["type"] == "L" and p["price"] < last["price"]):
-                result[-1] = p
+def _is_finite(x):
+    try:
+        return x == x and x not in (float("inf"), float("-inf"))
+    except TypeError:
+        return False
+
+
+def _is_sane_bar(d):
+    """過濾掉資料來源偶爾出現的異常值（例如某天 low 被錯誤回傳為 0 或極小值），
+    避免單一根爛資料把轉折波拉出一條不合理的長長尖刺"""
+    if not d:
+        return False
+    high, low, close = d.get("high"), d.get("low"), d.get("close")
+    if not (high is not None and high > 0 and low is not None and low > 0 and close is not None and close > 0):
+        return False
+    import math
+    if not (math.isfinite(high) and math.isfinite(low) and math.isfinite(close)):
+        return False
+    ma5 = d.get("ma5")
+    if ma5 is not None and ma5 > 0:
+        if low < ma5 * 0.4 or high > ma5 * 2.5:
+            return False
+    return True
+
+
+def build_zigzag(data):
+    """朱家泓「短線轉折波」畫法（依課程圖表2-1-3／2-1-4）：
+    用收盤價與5日均線的穿越關係取高低點——
+      收盤價「跌破」5日均線 → 取這段上漲過程的「高點」為一個轉折點
+      收盤價「突破」5日均線 → 取這段下跌過程的「低點」為一個轉折點
+    再把這些高低點依序連接成鋸齒狀的轉折波。"""
+    n = len(data)
+    # 找到第一個 MA5 已經有值、且資料正常的位置（前4根K棒沒有5日均線可比較）
+    start = 0
+    while start < n and (data[start]["ma5"] is None or not _is_sane_bar(data[start])):
+        start += 1
+    if start >= n - 1:
+        return []
+
+    state = "above" if data[start]["close"] >= data[start]["ma5"] else "below"  # 目前收盤在5日均線上方或下方
+    points = [{
+        "idx": start,
+        "price": data[start]["low"] if state == "above" else data[start]["high"],
+        "type": "L" if state == "above" else "H",
+    }]
+    extreme_idx = start
+    extreme_price = data[start]["high"] if state == "above" else data[start]["low"]
+
+    for i in range(start + 1, n):
+        d = data[i]
+        if d["ma5"] is None or not _is_sane_bar(d):
+            continue
+        if state == "above":
+            # 收盤在5日均線之上，持續追蹤這段上漲的最高點
+            if d["high"] > extreme_price:
+                extreme_price, extreme_idx = d["high"], i
+            if d["close"] < d["ma5"]:
+                # 收盤跌破5日均線 → 確認剛才追蹤到的高點為一個轉折高點
+                points.append({"idx": extreme_idx, "price": extreme_price, "type": "H"})
+                state = "below"
+                extreme_price, extreme_idx = d["low"], i
         else:
-            result.append(p)
-    return result
+            # 收盤在5日均線之下，持續追蹤這段下跌的最低點
+            if d["low"] < extreme_price:
+                extreme_price, extreme_idx = d["low"], i
+            if d["close"] > d["ma5"]:
+                # 收盤突破5日均線 → 確認剛才追蹤到的低點為一個轉折低點
+                points.append({"idx": extreme_idx, "price": extreme_price, "type": "L"})
+                state = "above"
+                extreme_price, extreme_idx = d["high"], i
+
+    # 收尾：把目前仍在追蹤中的高/低點畫出來，再接到最新一根K棒的收盤價，確保線一定連到最新資料
+    last_idx = n - 1
+    if extreme_idx != last_idx:
+        points.append({"idx": extreme_idx, "price": extreme_price, "type": "H" if state == "above" else "L"})
+        points.append({"idx": last_idx, "price": data[last_idx]["close"], "type": "L" if state == "above" else "H"})
+    else:
+        points.append({"idx": extreme_idx, "price": data[last_idx]["close"], "type": "H" if state == "above" else "L"})
+    return points
 
 
-def draw_chart(data, name):
-    tail = data[-120:]
+def draw_chart(data, name, pt=None):
+    raw_tail = data[-120:]
+    tail_start_idx = len(data) - len(raw_tail)
+    # 過濾掉資料異常的K棒（開高低收有任一項是 0、負值或非數字），
+    # 避免圖表出現「沒有K棒的空白位置」卻仍有轉折波或均線的線硬穿過去
+    tail = [d for d in raw_tail if d.get("open", 0) > 0 and d.get("high", 0) > 0
+            and d.get("low", 0) > 0 and d.get("close", 0) > 0
+            and all(_is_finite(d[k]) for k in ("open", "high", "low", "close"))]
     dates = [d["date"] for d in tail]
     vol_colors = ["#ef5350" if d["close"] >= d["open"] else "#26a69a" for d in tail]
     hist_colors = ["#ef5350" if (d["macdHist"] or 0) >= 0 else "#26a69a" for d in tail]
 
-    tail_start_idx = len(data) - len(tail)
-    zz = [p for p in build_zigzag(data) if p["idx"] >= tail_start_idx]
-    zz_x = [data[p["idx"]]["date"] for p in zz]
+    zz = build_zigzag(tail)
+    zz_x = [tail[p["idx"]]["date"] for p in zz]
     zz_y = [p["price"] for p in zz]
+
+    # 每個「型態確認」如果已成形，就把輔助線（頸線/壓力線/切線/軌道線）畫在圖上，
+    # 型態成形但未突破 → 虛線；已經突破 → 實線＋★標註，方便直接在圖上對照型態辨識依據
+    PATTERN_LINE_STYLE = {
+        "hs": {"color": "#ffd54f", "label": "頭肩底頸線"},
+        "chs": {"color": "#ff8a65", "label": "複式頭肩底頸線"},
+        "nb": {"color": "#81c784", "label": "N字底壓力"},
+        "tb": {"color": "#4dd0e1", "label": "三重底壓力"},
+        "rb": {"color": "#64b5f6", "label": "圓弧底壓力"},
+        "fb": {"color": "#ba68c8", "label": "一字底整理區間高點"},
+        "abc": {"color": "#ff2ecc", "label": "ABC下降切線起點"},
+        "channel": {"color": "#ffa726", "label": "上升軌道線"},
+        "blackk": {"color": "#e57373", "label": "大量黑K高點"},
+        "kbp": {"color": "rgba(255,255,255,.85)", "label": "K線橫盤首日高點"},
+    }
+    shapes, annotations = [], []
+    last_idx = len(data) - 1
+    if pt and pt.get("results"):
+        for p in pt["results"]:
+            if not p.get("formed"):
+                continue
+            style = PATTERN_LINE_STYLE.get(p["id"])
+            if not style:
+                continue
+            # 上升軌道線另外多畫一條下緣支撐線（line2），其餘型態只有一條輔助線（line）
+            for idx, ln in enumerate((p.get("line"), p.get("line2"))):
+                if not ln or ln["i1"] < tail_start_idx:
+                    continue
+                line_end_price = ln["p1"] + ln["slope"] * (last_idx - ln["i1"])
+                shapes.append(dict(
+                    type="line", xref="x", yref="y",
+                    x0=data[ln["i1"]]["date"], y0=ln["p1"],
+                    x1=data[last_idx]["date"], y1=line_end_price,
+                    line=dict(color=style["color"], width=2 if idx == 0 else 1.3,
+                               dash="solid" if p["breakout"] else "dash"),
+                ))
+                if idx == 0:
+                    annotations.append(dict(
+                        x=data[ln["i1"]]["date"], y=ln["p1"], xref="x", yref="y",
+                        text=style["label"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
+                        font=dict(color=style["color"], size=10), ax=-10, ay=-30,
+                    ))
+                    if p["breakout"]:
+                        annotations.append(dict(
+                            x=data[last_idx]["date"], y=data[last_idx]["close"], xref="x", yref="y",
+                            text="★ 突破" + p["name"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
+                            font=dict(color=style["color"], size=11), ax=10, ay=-35,
+                        ))
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.56, 0.22, 0.22], vertical_spacing=0.03)
 
@@ -1340,6 +1496,7 @@ def draw_chart(data, name):
         title=dict(text=f"{name} 技術分析圖", font=dict(color="#fff", size=14)),
         template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(15,20,35,1)",
         height=680, margin=dict(l=50, r=15, t=45, b=25),
+        shapes=shapes, annotations=annotations,
         xaxis=dict(rangeslider=dict(visible=False), gridcolor="rgba(255,255,255,.04)"),
         legend=dict(orientation="h", y=1.06, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
         showlegend=True,
@@ -1377,7 +1534,7 @@ def build_analysis_prompt(r):
     lines.append("")
     lines.append(f"【回後買上漲 8條件核對】必要條件通過 {r['pb']['requiredPassed']}/{r['pb']['requiredTotal']}" + ("（全數通過）" if r["pb"]["allPass"] else ""))
     lines.append("")
-    lines.append("【型態確認，10種進場型態】")
+    lines.append("【型態確認，11種進場型態】")
     for p in r["pt"]["results"]:
         status = "🔥剛突破（較前一交易日新增）" if p["justBroke"] else ("✅已突破" if p["breakout"] else ("🕒成形中未突破" if p["formed"] else "－未偵測到"))
         lines.append(f"・{p['name']}：{status}" + (f"（{p['detail']}）" if p.get("detail") else ""))
@@ -1415,8 +1572,8 @@ def run_ai_analysis(r, api_key, model):
 # Streamlit UI
 # ────────────────────────────────────────────────────────────────
 
-if "stock_text" not in st.session_state:
-    st.session_state.stock_text = "\n".join(SP500_LIST)
+if "stock_text_input" not in st.session_state:
+    st.session_state["stock_text_input"] = "\n".join(SP500_LIST)
 if "active_list" not in st.session_state:
     st.session_state.active_list = "sp500"
 
@@ -1434,18 +1591,17 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     if c1.button("S&P 500", use_container_width=True,
                   type="primary" if st.session_state.active_list == "sp500" else "secondary"):
-        st.session_state.stock_text = "\n".join(SP500_LIST)
+        st.session_state["stock_text_input"] = "\n".join(SP500_LIST)
         st.session_state.active_list = "sp500"
         st.rerun()
     if c2.button("我的清單", use_container_width=True,
                   type="primary" if st.session_state.active_list == "my" else "secondary"):
-        st.session_state.stock_text = "\n".join(MY_LIST)
+        st.session_state["stock_text_input"] = "\n".join(MY_LIST)
         st.session_state.active_list = "my"
         st.rerun()
 
-    stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）", value=st.session_state.stock_text,
+    stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
                                height=180, key="stock_text_input")
-    st.session_state.stock_text = stock_text
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
 
@@ -1481,7 +1637,7 @@ def run_batch_analysis():
         return
 
     stocks, seen = [], set()
-    for tok in st.session_state.stock_text.replace("，", ",").replace("、", ",").split():
+    for tok in st.session_state["stock_text_input"].replace("，", ",").replace("、", ",").split():
         for s in tok.split(","):
             s = s.strip().upper()
             if s and s not in seen:
@@ -1747,7 +1903,7 @@ else:
             st.markdown(f"{icon} {cond['label']}{tag}{detail}")
 
         st.divider()
-        st.markdown("### 🔍 型態確認（10種進場型態）")
+        st.markdown("### 🔍 型態確認（11種進場型態）")
         if r["pt"]["anyJustBroke"]:
             st.warning("🔥 偵測到剛突破買點（較前一交易日新增）")
         elif r["pt"]["anyBreakout"]:
@@ -1791,7 +1947,7 @@ else:
 
         st.divider()
         st.markdown("### 📉 技術分析圖表")
-        st.plotly_chart(draw_chart(r["data"], f"{r['stockId']} {r['name']}"), use_container_width=True)
+        st.plotly_chart(draw_chart(r["data"], f"{r['stockId']} {r['name']}", r["pt"]), use_container_width=True)
 
         with st.expander("📋 原始資料（最近20筆）"):
             raw_rows = []
