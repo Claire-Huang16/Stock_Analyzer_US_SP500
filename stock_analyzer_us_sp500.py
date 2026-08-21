@@ -4,7 +4,7 @@ US技術分析全攻略 · 美股評分分析系統 (Streamlit 版)
 由 stock_analyzer_us.html 轉換而成，邏輯與原 HTML/JS 版本一致：
 - 朱家泓四維度評分（趨勢／K線／均線／成交量，各25分，共100分），套用於美股個股分析
 - 回後買上漲 8 條件核對
-- 11 種進場型態確認（含「剛突破」：與前一交易日比較的新鮮突破訊號）
+- 15 種進場型態確認（含「剛突破」：與前一交易日比較的新鮮突破訊號）
 - 批次分析摘要表（可依進場條件／評分／型態確認篩選，關鍵字搜尋）
 - Plotly K線＋均線＋布林通道＋成交量＋MACD 圖表
 - OpenAI API「AI 智能綜合分析」
@@ -601,7 +601,7 @@ def fetch_company_name(token: str, stock_id: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────────
-# 技術指標計算、朱家泓四維度評分、回後買上漲、11種進場型態、Plotly 圖表
+# 技術指標計算、朱家泓四維度評分、回後買上漲、15種進場型態、Plotly 圖表
 # （與台股版邏輯完全一致，方法論本身與市場無關）
 # ────────────────────────────────────────────────────────────────
 def calc_ma(closes, p):
@@ -1350,7 +1350,105 @@ def detect_patterns(data, pb, skip_just_broke=False):
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "三天以上(含首日)收盤未突破首日K線高低點，帶量紅K突破首日高點為買點"})
 
-    # (11) 回後買上漲：沿用 checkPullbackBuy() 判斷結果
+    # (11) 高檔母子懷抱：中長紅K(母)＋隔日不過高不破低的黑K/變盤線(子)，次日確認轉折向下
+    # 依課程講義：屬於2根K線構成，上漲高檔出現中長紅，次日出現不過高也不破低的黑K線，
+    # 中長紅K線稱為母線，次日K線稱為子線；代表多空力量突然拉鋸，多頭上漲力道減弱。
+    id_, name = "harami_bear", "母子懷抱(高檔)"
+    added = False
+    if len(data) >= 3:
+        mother, child, confirm_day = data[last - 2], data[last - 1], data[last]
+        mother_body_pct = abs(mother["close"] - mother["open"]) / mother["close"]
+        mother_is_red = mother["close"] > mother["open"]
+        mother_is_med_long = mother_body_pct >= 0.035
+        child_contained = child["high"] <= mother["high"] and child["low"] >= mother["low"]
+        child_smaller = abs(child["close"] - child["open"]) < abs(mother["close"] - mother["open"]) * 0.6
+        at_high = mother["close"] >= data[last - 3]["close"] if last - 3 >= 0 else True
+        if mother_is_red and mother_is_med_long and child_contained and child_smaller and at_high:
+            breakout_h = confirm_day["close"] < child["close"]
+            results.append({"id": id_, "name": name, "formed": True, "breakout": breakout_h,
+                             "detail": f"母K(中長紅)高點＝{mother['high']:.2f}　子K收於母K範圍內　" + ("次日已確認轉折向下" if breakout_h else "等待次日確認轉折向下"),
+                             "desc": "上漲高檔出現中長紅K，次日不過高不破低的黑K線為母子懷抱，多頭上漲力道轉弱",
+                             "marker": {"idx": last - 1, "price": mother["high"], "dir": "up", "label": "母子懷抱"}})
+            added = True
+    if not added:
+        results.append({"id": id_, "name": name, "formed": False, "breakout": False,
+                         "detail": "尚未偵測到符合結構", "desc": "上漲高檔出現中長紅K，次日不過高不破低的黑K線為母子懷抱，多頭上漲力道轉弱"})
+
+    # (12) 低檔母子懷抱：中長黑K(母)＋隔日不過高不破低的紅K/變盤線(子)，次日確認轉折向上
+    id_, name = "harami_bull", "母子懷抱(低檔)"
+    added = False
+    if len(data) >= 3:
+        mother, child, confirm_day = data[last - 2], data[last - 1], data[last]
+        mother_body_pct = abs(mother["close"] - mother["open"]) / mother["close"]
+        mother_is_black = mother["close"] < mother["open"]
+        mother_is_med_long = mother_body_pct >= 0.035
+        child_contained = child["high"] <= mother["high"] and child["low"] >= mother["low"]
+        child_smaller = abs(child["close"] - child["open"]) < abs(mother["close"] - mother["open"]) * 0.6
+        at_low = mother["close"] <= data[last - 3]["close"] if last - 3 >= 0 else True
+        if mother_is_black and mother_is_med_long and child_contained and child_smaller and at_low:
+            breakout_h2 = confirm_day["close"] > child["close"]
+            results.append({"id": id_, "name": name, "formed": True, "breakout": breakout_h2,
+                             "detail": f"母K(中長黑)低點＝{mother['low']:.2f}　子K收於母K範圍內　" + ("次日已確認轉折向上" if breakout_h2 else "等待次日確認轉折向上"),
+                             "desc": "下跌低檔出現中長黑K，次日不過高不破低的紅K線為母子懷抱，空頭下跌力道轉弱",
+                             "marker": {"idx": last - 1, "price": mother["low"], "dir": "down", "label": "母子懷抱"}})
+            added = True
+    if not added:
+        results.append({"id": id_, "name": name, "formed": False, "breakout": False,
+                         "detail": "尚未偵測到符合結構", "desc": "下跌低檔出現中長黑K，次日不過高不破低的紅K線為母子懷抱，空頭下跌力道轉弱"})
+
+    # (13) 晨星：下跌中長黑K＋變盤線＋中長紅K，收盤站上首日黑K實體中點為低檔轉折向上
+    # 依課程講義：下跌低檔出現左邊中長黑K，右邊中長紅K，中間夾一根「變盤線」，是低檔轉折向上確認的K線組合。
+    id_, name = "morning_star", "晨星"
+    added = False
+    if len(data) >= 3:
+        s1, s2, s3 = data[last - 2], data[last - 1], data[last]
+        s1_body_pct = abs(s1["close"] - s1["open"]) / s1["close"]
+        s1_is_black = s1["close"] < s1["open"]
+        s1_med_long = s1_body_pct >= 0.035
+        s2_body_pct = abs(s2["close"] - s2["open"]) / s2["close"]
+        is_star1 = s2_body_pct < 0.035
+        s3_body_pct = abs(s3["close"] - s3["open"]) / s3["close"]
+        s3_is_red = s3["close"] > s3["open"]
+        s3_med_long = s3_body_pct >= 0.035
+        s1_mid = (s1["open"] + s1["close"]) / 2
+        closes_above_mid = s3["close"] > s1_mid
+        if s1_is_black and s1_med_long and is_star1 and s3_is_red and s3_med_long and closes_above_mid:
+            results.append({"id": id_, "name": name, "formed": True, "breakout": True,
+                             "detail": f"首日黑K實體中點＝{s1_mid:.2f}　收盤＝{s3['close']:.2f}（已站上中點，轉折確認）",
+                             "desc": "下跌出現中長黑K+變盤線+中長紅K，收盤站上首日實體中點為低檔轉折向上訊號",
+                             "marker": {"idx": last - 1, "price": s2["low"], "dir": "down", "label": "晨星"}})
+            added = True
+    if not added:
+        results.append({"id": id_, "name": name, "formed": False, "breakout": False,
+                         "detail": "尚未偵測到符合結構", "desc": "下跌出現中長黑K+變盤線+中長紅K，收盤站上首日實體中點為低檔轉折向上訊號"})
+
+    # (14) 夜星：上漲中長紅K＋變盤線＋中長黑K，收盤跌破首日紅K實體中點為高檔轉折向下
+    # 晨星的鏡像型態（課程講義未獨立列出，依同一套邏輯對稱推導）
+    id_, name = "evening_star", "夜星"
+    added = False
+    if len(data) >= 3:
+        e1, e2, e3 = data[last - 2], data[last - 1], data[last]
+        e1_body_pct = abs(e1["close"] - e1["open"]) / e1["close"]
+        e1_is_red = e1["close"] > e1["open"]
+        e1_med_long = e1_body_pct >= 0.035
+        e2_body_pct = abs(e2["close"] - e2["open"]) / e2["close"]
+        is_star2 = e2_body_pct < 0.035
+        e3_body_pct = abs(e3["close"] - e3["open"]) / e3["close"]
+        e3_is_black = e3["close"] < e3["open"]
+        e3_med_long = e3_body_pct >= 0.035
+        e1_mid = (e1["open"] + e1["close"]) / 2
+        closes_below_mid = e3["close"] < e1_mid
+        if e1_is_red and e1_med_long and is_star2 and e3_is_black and e3_med_long and closes_below_mid:
+            results.append({"id": id_, "name": name, "formed": True, "breakout": True,
+                             "detail": f"首日紅K實體中點＝{e1_mid:.2f}　收盤＝{e3['close']:.2f}（已跌破中點，轉折確認）",
+                             "desc": "上漲出現中長紅K+變盤線+中長黑K，收盤跌破首日實體中點為高檔轉折向下訊號",
+                             "marker": {"idx": last - 1, "price": e2["high"], "dir": "up", "label": "夜星"}})
+            added = True
+    if not added:
+        results.append({"id": id_, "name": name, "formed": False, "breakout": False,
+                         "detail": "尚未偵測到符合結構", "desc": "上漲出現中長紅K+變盤線+中長黑K，收盤跌破首日實體中點為高檔轉折向下訊號"})
+
+    # (15) 回後買上漲：沿用 checkPullbackBuy() 判斷結果
     if pb:
         pb_formed = pb["allPass"] or pb["requiredPassed"] >= pb["requiredTotal"] - 1
         results.append({
@@ -1493,6 +1591,14 @@ def draw_chart(data, name, pt=None):
         "blackk": {"color": "#e57373", "label": "大量黑K高點"},
         "kbp": {"color": "rgba(255,255,255,.85)", "label": "K線橫盤首日高點"},
     }
+    # 母子懷抱／晨星／夜星屬於2~3根K線的短線反轉訊號，沒有持續延伸的支撐/壓力線可畫，
+    # 改用箭頭標註直接指到型態發生的那根（或那兩根）K棒位置，方便在圖上直接辨識。
+    PATTERN_MARKER_STYLE = {
+        "harami_bear": {"color": "#ff8a65"},
+        "harami_bull": {"color": "#81c784"},
+        "morning_star": {"color": "#4dd0e1"},
+        "evening_star": {"color": "#ff5252"},
+    }
     shapes, annotations = [], []
     last_idx = len(tail) - 1
     if pt and pt.get("results"):
@@ -1500,32 +1606,42 @@ def draw_chart(data, name, pt=None):
             if not p.get("formed"):
                 continue
             style = PATTERN_LINE_STYLE.get(p["id"])
-            if not style:
-                continue
-            # 上升軌道線另外多畫一條下緣支撐線（line2），其餘型態只有一條輔助線（line）
-            for idx, ln in enumerate((p.get("line"), p.get("line2"))):
-                if not ln or ln["i1"] < 0 or ln["i1"] >= len(tail):
-                    continue
-                line_end_price = ln["p1"] + ln["slope"] * (last_idx - ln["i1"])
-                shapes.append(dict(
-                    type="line", xref="x", yref="y",
-                    x0=tail[ln["i1"]]["date"], y0=ln["p1"],
-                    x1=tail[last_idx]["date"], y1=line_end_price,
-                    line=dict(color=style["color"], width=2 if idx == 0 else 1.3,
-                               dash="solid" if p["breakout"] else "dash"),
-                ))
-                if idx == 0:
-                    annotations.append(dict(
-                        x=tail[ln["i1"]]["date"], y=ln["p1"], xref="x", yref="y",
-                        text=style["label"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
-                        font=dict(color=style["color"], size=10), ax=-10, ay=-30,
+            if style:
+                # 上升軌道線另外多畫一條下緣支撐線（line2），其餘型態只有一條輔助線（line）
+                for idx, ln in enumerate((p.get("line"), p.get("line2"))):
+                    if not ln or ln["i1"] < 0 or ln["i1"] >= len(tail):
+                        continue
+                    line_end_price = ln["p1"] + ln["slope"] * (last_idx - ln["i1"])
+                    shapes.append(dict(
+                        type="line", xref="x", yref="y",
+                        x0=tail[ln["i1"]]["date"], y0=ln["p1"],
+                        x1=tail[last_idx]["date"], y1=line_end_price,
+                        line=dict(color=style["color"], width=2 if idx == 0 else 1.3,
+                                   dash="solid" if p["breakout"] else "dash"),
                     ))
-                    if p["breakout"]:
+                    if idx == 0:
                         annotations.append(dict(
-                            x=tail[last_idx]["date"], y=tail[last_idx]["close"], xref="x", yref="y",
-                            text="★ 突破" + p["name"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
-                            font=dict(color=style["color"], size=11), ax=10, ay=-35,
+                            x=tail[ln["i1"]]["date"], y=ln["p1"], xref="x", yref="y",
+                            text=style["label"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
+                            font=dict(color=style["color"], size=10), ax=-10, ay=-30,
                         ))
+                        if p["breakout"]:
+                            annotations.append(dict(
+                                x=tail[last_idx]["date"], y=tail[last_idx]["close"], xref="x", yref="y",
+                                text="★ 突破" + p["name"], showarrow=True, arrowhead=2, arrowcolor=style["color"],
+                                font=dict(color=style["color"], size=11), ax=10, ay=-35,
+                            ))
+                continue
+            m_style = PATTERN_MARKER_STYLE.get(p["id"])
+            marker = p.get("marker")
+            if m_style and marker and 0 <= marker["idx"] < len(tail):
+                annotations.append(dict(
+                    x=tail[marker["idx"]]["date"], y=marker["price"], xref="x", yref="y",
+                    text=("★ " if p["breakout"] else "") + marker["label"],
+                    showarrow=True, arrowhead=2, arrowcolor=m_style["color"],
+                    font=dict(color=m_style["color"], size=11),
+                    ax=0, ay=-32 if marker["dir"] == "up" else 32,
+                ))
 
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.56, 0.22, 0.22], vertical_spacing=0.03)
 
@@ -1606,7 +1722,7 @@ def build_analysis_prompt(r):
     lines.append("")
     lines.append(f"【回後買上漲 8條件核對】必要條件通過 {r['pb']['requiredPassed']}/{r['pb']['requiredTotal']}" + ("（全數通過）" if r["pb"]["allPass"] else ""))
     lines.append("")
-    lines.append("【型態確認，11種進場型態】")
+    lines.append("【型態確認，15種進場型態】")
     for p in r["pt"]["results"]:
         status = "🔥剛突破（較前一交易日新增）" if p["justBroke"] else ("✅已突破" if p["breakout"] else ("🕒成形中未突破" if p["formed"] else "－未偵測到"))
         lines.append(f"・{p['name']}：{status}" + (f"（{p['detail']}）" if p.get("detail") else ""))
@@ -1975,7 +2091,7 @@ else:
             st.markdown(f"{icon} {cond['label']}{tag}{detail}")
 
         st.divider()
-        st.markdown("### 🔍 型態確認（11種進場型態）")
+        st.markdown("### 🔍 型態確認（15種進場型態）")
         if r["pt"]["anyJustBroke"]:
             st.warning("🔥 偵測到剛突破買點（較前一交易日新增）")
         elif r["pt"]["anyBreakout"]:
