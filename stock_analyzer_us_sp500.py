@@ -537,6 +537,8 @@ SP500_NAMES = {
 }
 
 MY_LIST = ['AXTI', 'LITE', 'COHR', 'RCAT', 'LWLG', 'UMC', 'AMKR', 'AEHR', 'ON', 'SMR', 'IREN', 'HIMX', 'TSEM', 'CRDO', 'PLTR', 'BABA', 'HOOD', 'ALAB', 'NVDA', 'MU', 'FTNT', 'AEX', 'OXY', 'MRVL', 'QCOM', 'XYZ', 'RKLB', 'FN', 'ORCL', 'AVGO', 'BE', 'CRWV', 'AMD', 'SHOP', 'VZ', 'OWL', 'TER', 'GOOGL', 'SMCI', 'QBTS', 'VRT', 'TSM', 'SNDK', 'ONDS', 'RCAT', 'NBIS', 'POET', 'TSEM', 'GLW', 'DELL', 'SPCX', 'ON', 'SMTC']
+# SOX（費城半導體指數）30檔成分股，這是相對穩定的產業型指數，直接內建清單即可，不需要額外呼叫API
+SOX_LIST = ['AMD', 'ADI', 'AMAT', 'ARM', 'ASML', 'ALAB', 'AVGO', 'COHR', 'CRDO', 'ENTG', 'GFS', 'INTC', 'KLAC', 'LRCX', 'MTSI', 'MRVL', 'MCHP', 'MU', 'MPWR', 'NVDA', 'NXPI', 'ON', 'QCOM', 'QRVO', 'SWKS', 'TSM', 'TER', 'LSCC', 'RMBS', 'ACLS']
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1230,30 +1232,38 @@ def detect_patterns(data, pb, skip_just_broke=False):
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
                          "detail": "尚未偵測到符合結構", "desc": "均線糾結、價格窄幅整理（區間範圍約10%內），帶量突破整理區間為買點"})
 
-    # (7) 突破ABC修正下降切線
+    # (7) 突破ABC修正下降切線：A、B兩高點畫下降切線，B之後要有C段拉回低點
     id_, name = "abc", "突破ABC修正下降切線"
     added = False
-    # 只看「最近」的轉折高點，取最後兩個（A、C），避免抓到太久遠、已經沒有參考意義的舊高點
+    # 只看「最近」的轉折高點，取最後兩個（A、B），避免抓到太久遠、已經沒有參考意義的舊高點
     recent_highs = [i for i in highs if i >= last - 40]
     if len(recent_highs) >= 2:
-        h1, h2 = recent_highs[-2], recent_highs[-1]  # A：較早較高；C：較近較低
+        h1, h2 = recent_highs[-2], recent_highs[-1]  # A：較早較高；B：較近較低
         y1, y2 = data[h1]["high"], data[h2]["high"]
-        # A、C之間要有拉回的低點（確認是ABC三段式修正），C要比A低，且間隔/時效合理
+        # A、B之間要有拉回的低點（確認A→低點→B是有效的一次反彈，不是隨便兩個高點連線）
         has_low_between = any(h1 < li < h2 for li in lows)
-        if y2 < y1 and h2 > h1 and has_low_between and (h2 - h1) <= 20 and (last - h2) <= 20:
+        # 依課程講義：B之後還要有一段「C」低點（真正的拉回），突破才是站在C低點之上完成的，
+        # 不能B之後價格根本沒拉回就直接算突破——那樣就只是A、B兩個高點連線，不是完整的ABC三段修正。
+        c_low = None
+        for ci in range(h2 + 1, last):
+            if c_low is None or data[ci]["low"] < c_low:
+                c_low = data[ci]["low"]
+        # 至少要有2%以上的拉回幅度，才算真正的C段（避免單純的價格雜訊被誤判成有效拉回）
+        has_c_leg = c_low is not None and c_low < data[h2]["close"] * 0.98
+        if y2 < y1 and h2 > h1 and has_low_between and has_c_leg and (h2 - h1) <= 20 and (last - h2) <= 20:
             slope_ = (y2 - y1) / (h2 - h1)
             line_at_last = y1 + slope_ * (last - h1)
             ma20up = _ma_slope_up(data, "ma20", 10, last)
             is_red = data[last]["close"] > data[last]["open"]
             breakout = last_close > line_at_last and ma20up and is_red
             results.append({"id": id_, "name": name, "formed": True, "breakout": breakout,
-                             "detail": f"下降切線位置≈{line_at_last:.2f}　現價＝{last_close:.2f}" + ("　MA20上揚" if ma20up else "　MA20未上揚"),
-                             "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點",
+                             "detail": f"下降切線位置≈{line_at_last:.2f}　C低點＝{c_low:.2f}　現價＝{last_close:.2f}" + ("　MA20上揚" if ma20up else "　MA20未上揚"),
+                             "desc": "多頭回檔呈ABC三段式下跌，A、B高點畫下降切線，C段拉回後帶量紅K突破切線為買點",
                              "line": {"i1": h1, "p1": y1, "i2": h2, "p2": y2, "slope": slope_}})
             added = True
     if not added:
         results.append({"id": id_, "name": name, "formed": False, "breakout": False,
-                         "detail": "尚未偵測到符合結構", "desc": "多頭回檔呈ABC下跌，反彈高點畫下降切線，MA20上揚下帶量紅K突破切線為買點"})
+                         "detail": "尚未偵測到符合結構", "desc": "多頭回檔呈ABC三段式下跌，A、B高點畫下降切線，C段拉回後帶量紅K突破切線為買點"})
 
     # (8) 突破上升軌道線：軌道線要有至少2個高點貼著同一條平行線才算數（依課程講義）
     id_, name = "channel", "突破上升軌道線"
@@ -1768,6 +1778,110 @@ if "active_list" not in st.session_state:
 st.title("📊 US技術分析全攻略 · 美股評分分析系統")
 st.caption("依據朱家泓《技術分析全攻略》課程方法論，從趨勢、K線、均線、成交量四大維度評分（美股版，資料來源：Financial Modeling Prep）")
 
+
+def fetch_etf_set(token):
+    """抓 FMP 的 ETF 清單，回傳 symbol 的 set，抓不到就回傳空 set（不影響主要功能）。"""
+    try:
+        etf_resp = requests.get(f"{FMP_BASE}/etf-list", params={"apikey": token}, timeout=20)
+        if etf_resp.ok:
+            etf_rows = etf_resp.json()
+            if isinstance(etf_rows, list):
+                return {e.get("symbol") for e in etf_rows if isinstance(e, dict) and e.get("symbol")}
+    except Exception:
+        pass
+    return set()
+
+
+def fetch_top100_gainers(token):
+    """今日漲幅前100：用 FMP 的 biggest-gainers 端點（Free方案可用），直接取得今日美股漲幅排行，
+    並排除ETF（另查一次 FMP 的 ETF 清單，只保留不在此清單中的個股）。"""
+    try:
+        resp = requests.get(f"{FMP_BASE}/biggest-gainers", params={"apikey": token}, timeout=20)
+        if not resp.ok:
+            return []
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+
+        etf_set = fetch_etf_set(token)
+
+        results = []
+        for r in rows:
+            sym = r.get("symbol") or r.get("ticker")
+            if not sym or sym in etf_set:
+                continue
+            pct_raw = r.get("changesPercentage")
+            if pct_raw is None:
+                pct_raw = r.get("changePercentage")
+            try:
+                pct = float(pct_raw) if pct_raw is not None else None
+            except (TypeError, ValueError):
+                pct = None
+            if pct is not None:
+                results.append({"id": sym, "name": r.get("name") or sym, "pct": pct})
+        results.sort(key=lambda r: r["pct"], reverse=True)
+        return results[:100]
+    except Exception:
+        return []
+
+
+def fetch_top100_volume(token):
+    """今日成交量前100：用 FMP 的 most-actives 端點（Free方案可用），直接取得今日美股成交量排行，
+    並排除ETF（另查一次 FMP 的 ETF 清單，只保留不在此清單中的個股）。"""
+    try:
+        resp = requests.get(f"{FMP_BASE}/most-actives", params={"apikey": token}, timeout=20)
+        if not resp.ok:
+            return []
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return []
+
+        etf_set = fetch_etf_set(token)
+
+        results = []
+        for r in rows:
+            sym = r.get("symbol") or r.get("ticker")
+            if not sym or sym in etf_set:
+                continue
+            vol_raw = r.get("volume")
+            if vol_raw is None:
+                vol_raw = r.get("totalVolume")
+            if vol_raw is None:
+                vol_raw = r.get("avgVolume")
+            try:
+                vol = float(vol_raw) if vol_raw is not None else None
+            except (TypeError, ValueError):
+                vol = None
+            results.append({"id": sym, "name": r.get("name") or sym, "volume": vol})
+        # FMP 本身已依成交量排序回傳；若抓得到明確的成交量欄位就再排序一次確保正確，抓不到就信任原始順序
+        if any(r["volume"] is not None for r in results):
+            results.sort(key=lambda r: r["volume"] or 0, reverse=True)
+        return results[:100]
+    except Exception:
+        return []
+
+
+def fetch_nasdaq100_symbols(token):
+    """Nasdaq-100 成分股：FMP 官方的 nasdaq-constituent 端點實際涵蓋的就是 Nasdaq-100
+    （100檔大型非金融股），不是包含全部Nasdaq上市公司（3000+檔）的 Nasdaq Composite——
+    那份清單太龐大，直接內建或批次分析都不切實際。用動態抓取（而非寫死清單），可以避免
+    這種常態調整成分股的指數清單過時。回傳 (symbols, error_msg)。"""
+    try:
+        resp = requests.get(f"{FMP_BASE}/nasdaq-constituent", params={"apikey": token}, timeout=20)
+        if not resp.ok:
+            return [], f"❌ 無法取得 Nasdaq-100 清單：HTTP {resp.status_code}"
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            return [], "❌ 未取得任何資料，請確認 API Key 是否有效"
+        symbols = [r.get("symbol") or r.get("ticker") for r in rows if isinstance(r, dict)]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return [], "❌ 資料格式無法解析，請稍後再試"
+        return symbols, None
+    except Exception as e:
+        return [], f"❌ 抓取 Nasdaq-100 成分股清單失敗：{e}"
+
+
 with st.sidebar:
     st.header("📊 US技術分析全攻略")
     st.caption("朱家泓方法論 · 美股評分系統")
@@ -1776,7 +1890,7 @@ with st.sidebar:
     st.caption("還沒有 Key？前往 [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) 免費註冊（Free 方案，250 次/天）")
 
     st.subheader("批次股票代號")
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button("S&P 500", use_container_width=True,
                   type="primary" if st.session_state.active_list == "sp500" else "secondary"):
         st.session_state["stock_text_input"] = "\n".join(SP500_LIST)
@@ -1787,6 +1901,29 @@ with st.sidebar:
         st.session_state["stock_text_input"] = "\n".join(MY_LIST)
         st.session_state.active_list = "my"
         st.rerun()
+    if c3.button("SOX半導體", use_container_width=True,
+                  type="primary" if st.session_state.active_list == "sox" else "secondary"):
+        st.session_state["stock_text_input"] = "\n".join(SOX_LIST)
+        st.session_state.active_list = "sox"
+        st.rerun()
+    if c4.button("Nasdaq-100", use_container_width=True,
+                  type="primary" if st.session_state.active_list == "nasdaq100" else "secondary"):
+        if not api_token:
+            st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取 Nasdaq-100 成分股清單"
+        else:
+            with st.spinner("抓取 Nasdaq-100 成分股清單中…"):
+                nasdaq100_symbols, err_msg = fetch_nasdaq100_symbols(api_token)
+            if nasdaq100_symbols:
+                st.session_state["stock_text_input"] = "\n".join(nasdaq100_symbols)
+                st.session_state.active_list = "nasdaq100"
+                st.session_state["top100_info"] = f"✅ 已套入 Nasdaq-100 成分股清單，共 {len(nasdaq100_symbols)} 檔"
+            else:
+                st.session_state["top100_info"] = err_msg or "❌ 未能取得 Nasdaq-100 清單，請稍後再試"
+        st.rerun()
+    if st.session_state.get("top100_info"):
+        (st.success if st.session_state["top100_info"].startswith("✅") else st.error)(
+            st.session_state["top100_info"]
+        )
 
     stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
                                height=180, key="stock_text_input")
@@ -1794,6 +1931,46 @@ with st.sidebar:
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
 
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
+
+    top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
+    if top100_clicked:
+        if not api_token:
+            st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取今日漲幅排行"
+        else:
+            with st.spinner("抓取今日美股漲幅排行中…"):
+                top100 = fetch_top100_gainers(api_token)
+            if top100:
+                st.session_state["stock_text_input"] = "\n".join(r["id"] for r in top100)
+                st.session_state.active_list = "top100"
+                st.session_state["top100_info"] = (
+                    f"✅ 已取得今日漲幅前{len(top100)}"
+                    f"（{top100[0]['id']} {top100[0]['name']} +{top100[0]['pct']:.2f}% 最高），正在自動開始批次分析…"
+                )
+                # 套入清單成功後，標記在下一次 rerun 時自動接著跑批次分析，不用使用者再按一次「批次分析」
+                st.session_state["_run_after_top100"] = True
+            else:
+                st.session_state["top100_info"] = "❌ 未取得任何資料，請確認 API Key 是否有效"
+        st.rerun()
+
+    volume100_clicked = st.button("📊 成交量前100分析", use_container_width=True)
+    if volume100_clicked:
+        if not api_token:
+            st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取今日成交量排行"
+        else:
+            with st.spinner("抓取今日美股成交量排行中…"):
+                vol100 = fetch_top100_volume(api_token)
+            if vol100:
+                st.session_state["stock_text_input"] = "\n".join(r["id"] for r in vol100)
+                st.session_state.active_list = "volume100"
+                vol_text = f"量={int(vol100[0]['volume']):,}" if vol100[0]["volume"] is not None else "依FMP成交量排序"
+                st.session_state["top100_info"] = (
+                    f"✅ 已取得今日成交量前{len(vol100)}"
+                    f"（{vol100[0]['id']} {vol100[0]['name']} {vol_text} 最高），正在自動開始批次分析…"
+                )
+                st.session_state["_run_after_top100"] = True
+            else:
+                st.session_state["top100_info"] = "❌ 未取得任何資料，請確認 API Key 是否有效"
+        st.rerun()
 
     st.divider()
     openai_key = st.text_input("OpenAI API Key（選填）", type="password", placeholder="sk-...")
@@ -1890,7 +2067,7 @@ def run_batch_analysis():
     st.session_state.selected_stock_idx = 0
 
 
-if run_clicked:
+if run_clicked or st.session_state.pop("_run_after_top100", False):
     run_batch_analysis()
 if "batch_results" not in st.session_state:
     st.info("📈 請在左側輸入 Financial Modeling Prep API Key 與美股代號，點擊「批次分析」即可開始。")
