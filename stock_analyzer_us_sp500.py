@@ -1925,15 +1925,12 @@ with st.sidebar:
             st.session_state["top100_info"]
         )
 
-    stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
-                               height=180, key="stock_text_input")
-
-    days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
-
-    run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
-
-    top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
-    if top100_clicked:
+    # ── 漲幅前100／成交量前100：實際抓資料與設定 stock_text_input 的邏輯，
+    # 必須在 text_area 元件實例化「之前」執行，否則會觸發 StreamlitAPIException
+    # （Streamlit 不允許在 widget 已經渲染後才設定該 widget key 對應的 session_state）。
+    # 所以按鈕本身仍畫在 text_area 之後（視覺順序不變），按下後只設一個旗標並 rerun，
+    # 實際抓資料的邏輯則挪到這裡、text_area 之前執行。
+    if st.session_state.pop("_trigger_top100_gainers", False):
         if not api_token:
             st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取今日漲幅排行"
         else:
@@ -1950,10 +1947,8 @@ with st.sidebar:
                 st.session_state["_run_after_top100"] = True
             else:
                 st.session_state["top100_info"] = "❌ 未取得任何資料，請確認 API Key 是否有效"
-        st.rerun()
 
-    volume100_clicked = st.button("📊 成交量前100分析", use_container_width=True)
-    if volume100_clicked:
+    if st.session_state.pop("_trigger_volume100", False):
         if not api_token:
             st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取今日成交量排行"
         else:
@@ -1970,6 +1965,22 @@ with st.sidebar:
                 st.session_state["_run_after_top100"] = True
             else:
                 st.session_state["top100_info"] = "❌ 未取得任何資料，請確認 API Key 是否有效"
+
+    stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
+                               height=180, key="stock_text_input")
+
+    days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
+
+    run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
+
+    top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
+    if top100_clicked:
+        st.session_state["_trigger_top100_gainers"] = True
+        st.rerun()
+
+    volume100_clicked = st.button("📊 成交量前100分析", use_container_width=True)
+    if volume100_clicked:
+        st.session_state["_trigger_volume100"] = True
         st.rerun()
 
     st.divider()
