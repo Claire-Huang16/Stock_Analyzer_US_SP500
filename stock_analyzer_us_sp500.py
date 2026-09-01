@@ -12,6 +12,8 @@ US技術分析全攻略 · 美股評分分析系統 (Streamlit 版)
 """
 
 import time
+import json
+import os
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -536,9 +538,53 @@ SP500_NAMES = {
     'ZTS': 'Zoetis'
 }
 
-MY_LIST = ['AXTI', 'LITE', 'COHR', 'RCAT', 'LWLG', 'UMC', 'AMKR', 'AEHR', 'ON', 'SMR', 'IREN', 'HIMX', 'TSEM', 'CRDO', 'PLTR', 'BABA', 'HOOD', 'ALAB', 'NVDA', 'MU', 'FTNT', 'AEX', 'OXY', 'MRVL', 'QCOM', 'XYZ', 'RKLB', 'FN', 'ORCL', 'AVGO', 'BE', 'CRWV', 'AMD', 'SHOP', 'VZ', 'OWL', 'TER', 'GOOGL', 'SMCI', 'QBTS', 'VRT', 'TSM', 'SNDK', 'ONDS', 'RCAT', 'NBIS', 'POET', 'TSEM', 'GLW', 'DELL', 'SPCX', 'ON', 'SMTC']
+MY_LIST_DEFAULT = ['AXTI', 'LITE', 'COHR', 'RCAT', 'LWLG', 'UMC', 'AMKR', 'AEHR', 'ON', 'SMR', 'IREN', 'HIMX', 'TSEM', 'CRDO', 'PLTR', 'BABA', 'HOOD', 'ALAB', 'NVDA', 'MU', 'FTNT', 'AEX', 'OXY', 'MRVL', 'QCOM', 'XYZ', 'RKLB', 'FN', 'ORCL', 'AVGO', 'BE', 'CRWV', 'AMD', 'SHOP', 'VZ', 'OWL', 'TER', 'GOOGL', 'SMCI', 'QBTS', 'VRT', 'TSM', 'SNDK', 'ONDS', 'RCAT', 'NBIS', 'POET', 'TSEM', 'GLW', 'DELL', 'SPCX', 'ON', 'SMTC']
 # SOX（費城半導體指數）30檔成分股，這是相對穩定的產業型指數，直接內建清單即可，不需要額外呼叫API
 SOX_LIST = ['AMD', 'ADI', 'AMAT', 'ARM', 'ASML', 'ALAB', 'AVGO', 'COHR', 'CRDO', 'ENTG', 'GFS', 'INTC', 'KLAC', 'LRCX', 'MTSI', 'MRVL', 'MCHP', 'MU', 'MPWR', 'NVDA', 'NXPI', 'ON', 'QCOM', 'QRVO', 'SWKS', 'TSM', 'TER', 'LSCC', 'RMBS', 'ACLS']
+
+
+# ────────────────────────────────────────────────────────────────
+# 自訂清單（我的清單／清單1／清單2／清單3）：存成本機JSON檔，跨次啟動App都會保留
+# （對應 HTML 版用 localStorage 的效果，只是這裡改用本機檔案，因為 Streamlit
+# 的 session_state 每次重新啟動就會清空，沒有等同 localStorage 的內建機制）。
+# 「我的清單」預設帶入原本內建的 MY_LIST_DEFAULT 觀察名單，清單1/2/3預設空白。
+# ────────────────────────────────────────────────────────────────
+CUSTOM_LISTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_lists_us.json")
+CUSTOM_LIST_KEYS = ["my", "my1", "my2", "my3"]
+CUSTOM_LIST_LABELS = {"my": "我的清單", "my1": "我的清單1", "my2": "我的清單2", "my3": "我的清單3"}
+
+
+def load_custom_lists():
+    defaults = {"my": list(MY_LIST_DEFAULT), "my1": [], "my2": [], "my3": []}
+    if os.path.exists(CUSTOM_LISTS_FILE):
+        try:
+            with open(CUSTOM_LISTS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            for k in CUSTOM_LIST_KEYS:
+                if k in saved and isinstance(saved[k], list):
+                    defaults[k] = saved[k]
+        except Exception:
+            pass
+    return defaults
+
+
+def save_custom_lists(lists: dict):
+    try:
+        with open(CUSTOM_LISTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(lists, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def parse_stock_tokens(text: str):
+    stocks, seen = [], set()
+    for tok in text.replace("，", ",").replace("、", ",").split():
+        for s in tok.split(","):
+            s = s.strip()
+            if s and s not in seen:
+                seen.add(s)
+                stocks.append(s)
+    return stocks
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1023,10 +1069,10 @@ def _ma_slope_up(data, key, n, last_idx):
 
 
 def detect_patterns(data, pb, skip_just_broke=False):
-    # 型態辨識固定只看「跟圖表顯示範圍一致」的最近120根K棒，並套用同一套壞資料過濾規則，
-    # 確保型態辨識用的轉折波，跟圖表上實際畫出來的轉折波／輔助線是同一組資料算出來的結果
-    # ——否則用全部歷史資料算出的轉折點，可能跟圖表只用最近120根算出的轉折點對不起來。
-    data = [d for d in data[-120:] if d.get("open", 0) > 0 and d.get("high", 0) > 0
+    # 型態辨識固定看跟圖表一致的完整資料範圍（也就是「分析天數」實際抓到的全部K棒），
+    # 並套用同一套壞資料過濾規則，確保型態辨識用的轉折波，跟圖表上實際畫出來的
+    # 轉折波／輔助線是同一組資料算出來的結果——避免用不同範圍算出對不起來的轉折點。
+    data = [d for d in data if d.get("open", 0) > 0 and d.get("high", 0) > 0
             and d.get("low", 0) > 0 and d.get("close", 0) > 0
             and all(_is_finite(d[k]) for k in ("open", "high", "low", "close"))]
     last = len(data) - 1
@@ -1573,7 +1619,9 @@ def build_zigzag(data):
 
 
 def draw_chart(data, name, pt=None):
-    raw_tail = data[-120:]
+    # 圖表顯示範圍改用完整的 data（已由「分析天數」在抓資料時決定範圍），
+    # 不再寫死只看最近120根K棒，讓滑桿調整能真正反映在圖表上。
+    raw_tail = data
     # 過濾掉資料異常的K棒（開高低收有任一項是 0、負值或非數字），
     # 避免圖表出現「沒有K棒的空白位置」卻仍有轉折波或均線的線硬穿過去
     tail = [d for d in raw_tail if d.get("open", 0) > 0 and d.get("high", 0) > 0
@@ -1774,6 +1822,8 @@ if "stock_text_input" not in st.session_state:
     st.session_state["stock_text_input"] = "\n".join(SP500_LIST)
 if "active_list" not in st.session_state:
     st.session_state.active_list = "sp500"
+if "custom_lists" not in st.session_state:
+    st.session_state.custom_lists = load_custom_lists()
 
 st.title("📊 US技術分析全攻略 · 美股評分分析系統")
 st.caption("依據朱家泓《技術分析全攻略》課程方法論，從趨勢、K線、均線、成交量四大維度評分（美股版，資料來源：Financial Modeling Prep）")
@@ -1890,23 +1940,18 @@ with st.sidebar:
     st.caption("還沒有 Key？前往 [financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs) 免費註冊（Free 方案，250 次/天）")
 
     st.subheader("批次股票代號")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     if c1.button("S&P 500", use_container_width=True,
                   type="primary" if st.session_state.active_list == "sp500" else "secondary"):
         st.session_state["stock_text_input"] = "\n".join(SP500_LIST)
         st.session_state.active_list = "sp500"
         st.rerun()
-    if c2.button("我的清單", use_container_width=True,
-                  type="primary" if st.session_state.active_list == "my" else "secondary"):
-        st.session_state["stock_text_input"] = "\n".join(MY_LIST)
-        st.session_state.active_list = "my"
-        st.rerun()
-    if c3.button("SOX半導體", use_container_width=True,
+    if c2.button("SOX半導體", use_container_width=True,
                   type="primary" if st.session_state.active_list == "sox" else "secondary"):
         st.session_state["stock_text_input"] = "\n".join(SOX_LIST)
         st.session_state.active_list = "sox"
         st.rerun()
-    if c4.button("Nasdaq-100", use_container_width=True,
+    if c3.button("Nasdaq-100", use_container_width=True,
                   type="primary" if st.session_state.active_list == "nasdaq100" else "secondary"):
         if not api_token:
             st.session_state["top100_info"] = "❌ 請先輸入 FMP API Key 才能抓取 Nasdaq-100 成分股清單"
@@ -1920,6 +1965,25 @@ with st.sidebar:
             else:
                 st.session_state["top100_info"] = err_msg or "❌ 未能取得 Nasdaq-100 清單，請稍後再試"
         st.rerun()
+
+    # 我的清單／清單1／清單2／清單3：每列一個選取按鈕＋一個 × 清除按鈕
+    for key in CUSTOM_LIST_KEYS:
+        col_sel, col_clear = st.columns([5, 1])
+        items = st.session_state.custom_lists.get(key, [])
+        label = CUSTOM_LIST_LABELS[key] + (f"（{len(items)}）" if items else "")
+        if col_sel.button(label, use_container_width=True, key=f"sel_{key}",
+                           type="primary" if st.session_state.active_list == key else "secondary"):
+            st.session_state["stock_text_input"] = "\n".join(items)
+            st.session_state.active_list = key
+            st.rerun()
+        if col_clear.button("×", use_container_width=True, key=f"clear_{key}",
+                             help=f"清除「{CUSTOM_LIST_LABELS[key]}」"):
+            st.session_state.custom_lists[key] = []
+            save_custom_lists(st.session_state.custom_lists)
+            if st.session_state.active_list == key:
+                st.session_state["stock_text_input"] = ""
+            st.rerun()
+
     if st.session_state.get("top100_info"):
         (st.success if st.session_state["top100_info"].startswith("✅") else st.error)(
             st.session_state["top100_info"]
@@ -1968,6 +2032,32 @@ with st.sidebar:
 
     stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
                                height=180, key="stock_text_input")
+
+    save_col1, save_col2 = st.columns(2)
+    if save_col1.button("💾 更新我的清單", use_container_width=True):
+        stocks = parse_stock_tokens(stock_text)
+        if stocks:
+            st.session_state.custom_lists["my"] = stocks
+            save_custom_lists(st.session_state.custom_lists)
+            st.success(f"已更新我的清單（{len(stocks)}檔）")
+        else:
+            st.warning("批次股票代號目前是空的，沒有可儲存的內容")
+    if save_col2.button("➕ 存為清單1/2/3", use_container_width=True):
+        stocks = parse_stock_tokens(stock_text)
+        if stocks:
+            target = next((k for k in ("my1", "my2", "my3") if not st.session_state.custom_lists.get(k)), None)
+            overwritten = target is None
+            if overwritten:
+                target = "my1"  # 三槽都滿了，覆蓋清單1（最舊的）
+            st.session_state.custom_lists[target] = stocks
+            save_custom_lists(st.session_state.custom_lists)
+            label = CUSTOM_LIST_LABELS[target]
+            if overwritten:
+                st.warning(f"三槽已滿，已覆蓋{label}（{len(stocks)}檔）")
+            else:
+                st.success(f"已存入{label}（{len(stocks)}檔）")
+        else:
+            st.warning("批次股票代號目前是空的，沒有可儲存的內容")
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
 
