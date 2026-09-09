@@ -633,6 +633,122 @@ def fetch_price_data(stock_id: str, token: str, days: int):
     return rows
 
 
+# ── 近3年 P/E 區間（/stable/ratios，季頻資料，每股票每次批次分析都會多打一次API）──
+# FMP的季度P/E欄位名稱在不同版本文件間出現過 priceToEarningsRatio／priceEarningsRatio
+# 兩種說法，這裡兩個都相容處理。過濾掉0/負值/非數字（虧損股常見），取這3年內的最大
+# 最小值作為區間，最新一筆視為目前P/E。
+def fetch_pe_range_us(token: str, symbol: str, years: int = 3):
+    sym = to_fmp_symbol(symbol)
+    limit = years * 4 + 4
+    url = f"{FMP_BASE}/ratios?symbol={sym}&period=quarter&limit={limit}&apikey={token}"
+    rows = api_fetch(url)
+    if not isinstance(rows, list) or not rows:
+        return None
+    rows = sorted(rows, key=lambda r: str(r.get("date", "")))
+    values = []
+    for r in rows:
+        v = r.get("priceToEarningsRatio")
+        if v is None:
+            v = r.get("priceEarningsRatio")
+        if v is None:
+            v = r.get("peRatio")
+        try:
+            v = float(v)
+            if v > 0:
+                values.append(v)
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    return {"min": min(values), "max": max(values), "current": values[-1]}
+
+
+# ── 近3季營收 YoY／QoQ（/stable/income-statement，每股票每次批次分析都會多打一次API）──
+# 美股是季報，不是台股那種月營收，所以這裡對應的是「季」而非「月」。季度歸屬用財報
+# 的 date（期末日）欄位的月份自行推算日曆季（Q1=1-3月...），不依賴period欄位的字串
+# 格式，這樣算法跟下面的均價YoY可以共用同一組季度定義。
+def fetch_revenue_yoy_qoq_us(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    url = f"{FMP_BASE}/income-statement?symbol={sym}&period=quarter&limit=20&apikey={token}"
+    rows = api_fetch(url)
+    if not isinstance(rows, list) or not rows:
+        return None
+    items = []
+    for r in rows:
+        d = str(r.get("date", ""))[:10]
+        if len(d) < 7 or r.get("revenue") is None:
+            continue
+        y, mo = int(d[:4]), int(d[5:7])
+        items.append({"year": y, "quarter": (mo - 1) // 3 + 1, "date": d, "revenue": r["revenue"]})
+    if not items:
+        return None
+    items.sort(key=lambda x: x["date"])
+    rev_map = {f"{x['year']}-Q{x['quarter']}": x["revenue"] for x in items}
+    last3 = items[-3:]
+    result = []
+    for x in last3:
+        prev_key = f"{x['year']-1}-Q4" if x["quarter"] == 1 else f"{x['year']}-Q{x['quarter']-1}"
+        yoy_key = f"{x['year']-1}-Q{x['quarter']}"
+        qoq = ((x["revenue"] - rev_map[prev_key]) / rev_map[prev_key] * 100) if rev_map.get(prev_key) else None
+        yoy = ((x["revenue"] - rev_map[yoy_key]) / rev_map[yoy_key] * 100) if rev_map.get(yoy_key) else None
+        result.append({"year": x["year"], "quarter": x["quarter"], "revenue": x["revenue"], "qoq": qoq, "yoy": yoy})
+    return result
+
+
+def _last_n_calendar_quarters(n: int):
+    out = []
+    y, q = datetime.today().year, (datetime.today().month - 1) // 3 + 1
+    for _ in range(n):
+        out.insert(0, {"year": y, "quarter": q})
+        q -= 1
+        if q < 1:
+            q = 4
+            y -= 1
+    return out
+
+
+# ── 近3季「當季均價」YoY（跟營收YoY用同一組季度，方便橫向比較；若沒給季度清單則
+# 自己算「最近3個日曆季」，讓這個功能可以獨立於營收YoY單獨使用）──
+# 自己抓一段股價區間、按日曆季分組算平均收盤價，再跟去年同季的均價比。這是獨立於
+# 「分析天數」的另一次歷史股價查詢，每股票每次批次分析又會多打一次API。
+def fetch_quarterly_avg_price_yoy_us(token: str, symbol: str, quarters_list=None):
+    if not quarters_list:
+        quarters_list = _last_n_calendar_quarters(3)
+    oldest = quarters_list[0]
+    start = f"{oldest['year'] - 1}-01-01"
+    end = datetime.today().strftime("%Y-%m-%d")
+    sym = to_fmp_symbol(symbol)
+    url = f"{FMP_BASE}/historical-price-eod/full?symbol={sym}&from={start}&to={end}&apikey={token}"
+    j = api_fetch(url)
+    rows = j if isinstance(j, list) else (j.get("historical") if isinstance(j, dict) else None)
+    if not rows:
+        return None
+    sums, counts = {}, {}
+    for r in rows:
+        d = str(r.get("date", ""))[:10]
+        if len(d) < 7:
+            continue
+        y, mo = int(d[:4]), int(d[5:7])
+        key = f"{y}-Q{(mo - 1) // 3 + 1}"
+        try:
+            c = float(r["close"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if c <= 0:
+            continue
+        sums[key] = sums.get(key, 0) + c
+        counts[key] = counts.get(key, 0) + 1
+    avg_map = {k: sums[k] / counts[k] for k in sums}
+    result = []
+    for qtr in quarters_list:
+        key = f"{qtr['year']}-Q{qtr['quarter']}"
+        yoy_key = f"{qtr['year'] - 1}-Q{qtr['quarter']}"
+        this_avg, last_avg = avg_map.get(key), avg_map.get(yoy_key)
+        yoy = ((this_avg - last_avg) / last_avg * 100) if (this_avg is not None and last_avg) else None
+        result.append({"year": qtr["year"], "quarter": qtr["quarter"], "avg": this_avg, "avgLastYear": last_avg, "yoy": yoy})
+    return result
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_company_name(token: str, stock_id: str) -> str:
     if stock_id in SP500_NAMES:
@@ -646,6 +762,153 @@ def fetch_company_name(token: str, stock_id: str) -> str:
     except Exception:
         pass
     return stock_id
+
+
+# ────────────────────────────────────────────────────────────────
+# 分析師評等升降／目標價調整／內部人買賣（美股專屬，台股FinMind無對應資料）
+# 注意：FMP官方FAQ明確表示目前不提供「空單比例／short interest」資料，
+# 所以這裡沒有做空單比例——不是漏做，是FMP資料源本身沒有這項資料。
+# ────────────────────────────────────────────────────────────────
+def fetch_grades_consensus(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    try:
+        j = api_fetch(f"{FMP_BASE}/grades-consensus?symbol={sym}&apikey={token}")
+        return j[0] if isinstance(j, list) and j else None
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def fetch_grades_history(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    try:
+        j = api_fetch(f"{FMP_BASE}/grades?symbol={sym}&apikey={token}")
+        return j if isinstance(j, list) else []
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def fetch_price_target_consensus(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    try:
+        j = api_fetch(f"{FMP_BASE}/price-target-consensus?symbol={sym}&apikey={token}")
+        return j[0] if isinstance(j, list) and j else None
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def fetch_price_target_summary(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    try:
+        j = api_fetch(f"{FMP_BASE}/price-target-summary?symbol={sym}&apikey={token}")
+        return j[0] if isinstance(j, list) and j else None
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def fetch_insider_trading(token: str, symbol: str):
+    sym = to_fmp_symbol(symbol)
+    try:
+        j = api_fetch(f"{FMP_BASE}/insider-trading/search?symbol={sym}&page=0&limit=20&apikey={token}")
+        return j if isinstance(j, list) else []
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def render_analyst_fundamentals(token: str, symbol: str):
+    """抓取並渲染分析師評等總覽／評等異動／目標價／內部人交易，四塊資料各自獨立
+    抓取、獨立處理失敗（一項失敗不影響其他三項），用 __error__ 標記傳遞錯誤訊息。"""
+    errs = []
+
+    consensus = fetch_grades_consensus(token, symbol)
+    if isinstance(consensus, dict) and consensus.get("__error__"):
+        errs.append(f"評等總覽：{consensus['__error__']}")
+        consensus = None
+
+    grades_hist = fetch_grades_history(token, symbol)
+    if isinstance(grades_hist, dict) and grades_hist.get("__error__"):
+        errs.append(f"評等異動紀錄：{grades_hist['__error__']}")
+        grades_hist = []
+
+    pt_consensus = fetch_price_target_consensus(token, symbol)
+    if isinstance(pt_consensus, dict) and pt_consensus.get("__error__"):
+        errs.append(f"目標價共識：{pt_consensus['__error__']}")
+        pt_consensus = None
+
+    pt_summary = fetch_price_target_summary(token, symbol)
+    if isinstance(pt_summary, dict) and pt_summary.get("__error__"):
+        errs.append(f"目標價趨勢：{pt_summary['__error__']}")
+        pt_summary = None
+
+    insider = fetch_insider_trading(token, symbol)
+    if isinstance(insider, dict) and insider.get("__error__"):
+        errs.append(f"內部人交易：{insider['__error__']}")
+        insider = []
+
+    if consensus:
+        st.markdown("#### 🏦 分析師評等總覽")
+        sb, b = consensus.get("strongBuy", 0) or 0, consensus.get("buy", 0) or 0
+        h = consensus.get("hold", 0) or 0
+        s, ss = consensus.get("sell", 0) or 0, consensus.get("strongSell", 0) or 0
+        total_n = sb + b + h + s + ss
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("強力買進", sb)
+        c2.metric("買進", b)
+        c3.metric("持有", h)
+        c4.metric("賣出", s)
+        c5.metric("強力賣出", ss)
+        st.caption(f"共 {total_n} 位分析師覆蓋")
+
+    if grades_hist:
+        st.markdown("#### 🔔 最近評等異動")
+        rows = []
+        for g in grades_hist[:8]:
+            rows.append({
+                "日期": g.get("date", "--"), "機構": g.get("gradingCompany", "--"),
+                "原評等": g.get("previousGrade", "--"), "新評等": g.get("newGrade", "--"),
+                "動作": g.get("action", "--"),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    if pt_consensus or pt_summary:
+        st.markdown("#### 🎯 分析師目標價")
+        tc1, tc2, tc3 = st.columns(3)
+        if pt_consensus:
+            tgt = pt_consensus.get("targetConsensus")
+            lo, hi = pt_consensus.get("targetLow"), pt_consensus.get("targetHigh")
+            tc1.metric("共識目標價", f"${tgt:.2f}" if tgt is not None else "--")
+            tc2.metric("目標價區間", f"${lo:.2f} ~ ${hi:.2f}" if lo is not None and hi is not None else "--")
+        if pt_summary:
+            q, y = pt_summary.get("lastQuarterAvgPriceTarget"), pt_summary.get("lastYearAvgPriceTarget")
+            try:
+                q_f, y_f = float(q), float(y)
+                if y_f:
+                    trend = (q_f - y_f) / y_f * 100
+                    tc3.metric("近一季 vs 去年平均目標價", f"{trend:+.1f}%", delta=f"${y_f:.2f} → ${q_f:.2f}")
+            except (TypeError, ValueError):
+                pass
+
+    if insider:
+        st.markdown("#### 👤 最近內部人交易")
+        rows = []
+        for t in insider[:8]:
+            tx_type = t.get("transactionType", "--")
+            shares = t.get("securitiesTransacted")
+            price = t.get("price")
+            rows.append({
+                "日期": t.get("transactionDate", t.get("filingDate", "--")),
+                "姓名/職稱": f"{t.get('reportingName', '--')}（{t.get('typeOfOwner', '')}）",
+                "類型": tx_type,
+                "股數": f"{shares:,.0f}" if shares is not None else "--",
+                "價格": f"${price:.2f}" if price is not None else "--",
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    if not (consensus or grades_hist or pt_consensus or pt_summary or insider):
+        st.caption("目前查無分析師評等/目標價/內部人交易資料（可能是這檔股票沒有分析師覆蓋，或FMP無該類資料）。")
+
+    st.caption("ⓘ FMP目前不提供空單比例（short interest）資料，故無此項。")
+    if errs:
+        st.warning("部分資料讀取失敗：" + "　".join(errs))
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1767,6 +2030,13 @@ def build_analysis_prompt(r):
     lines.append(f"資料日期：{last['date']}　收盤：${last['close']}　漲跌：{'+' if chg >= 0 else ''}{chg:.2f} ({'+' if chgp >= 0 else ''}{chgp:.2f}%)")
     vol_ratio_txt = f"{(last['volume'] / last['vm20']):.2f}" if last["vm20"] else "N/A"
     lines.append(f"成交量：{last['volume']:,}　量比(vs MA20量)：{vol_ratio_txt}x")
+    if last.get("macd") is not None and last.get("macdSig") is not None:
+        bias = "（偏多）" if last["macd"] > last["macdSig"] else "（偏空）"
+        lines.append(f"MACD：DIF={last['macd']:.2f}　Signal={last['macdSig']:.2f}　柱狀={last['macdHist']:.2f}{bias}")
+    if last.get("bbU") is not None and last.get("bbL") is not None:
+        bb_w = last["bbU"] - last["bbL"]
+        bb_p = ((last["close"] - last["bbL"]) / bb_w * 100) if bb_w else 50
+        lines.append(f"布林通道：上軌={last['bbU']:.2f}　下軌={last['bbL']:.2f}　股價位置={bb_p:.0f}%")
     lines.append("")
     lines.append(f"【朱家泓四維度評分】總分 {r['total']}/100")
     lines.append(f"趨勢 {r['tr']['score']}/25、K線 {r['kl']['score']}/25、均線 {r['ma']['score']}/25、成交量 {r['vl']['score']}/25")
@@ -2061,6 +2331,11 @@ with st.sidebar:
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
 
+    st.caption("以下每勾一項，批次分析都會為每檔股票多打1次API，股票數多時會明顯變慢：")
+    show_pe = st.checkbox("📐 近3年P/E區間", value=False)
+    show_rev = st.checkbox("📈 近3季營收YoY/QoQ", value=False)
+    show_pxyoy = st.checkbox("💹 近3季均價YoY（可獨立勾選；若同時勾營收，季度會對齊營收那組）", value=False)
+
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
 
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
@@ -2140,13 +2415,32 @@ def run_batch_analysis():
                 key=lambda x: x["date"],
             )
             name = fetch_company_name(api_token, sid)
+            pe_range = None
+            if show_pe:
+                try:
+                    pe_range = fetch_pe_range_us(api_token, sid, 3)
+                except Exception:
+                    pass  # P/E抓不到就顯示無資料，不影響其他分析
+            rev_range = None
+            if show_rev:
+                try:
+                    rev_range = fetch_revenue_yoy_qoq_us(api_token, sid)
+                except Exception:
+                    pass  # 營收抓不到就顯示無資料，不影響其他分析
+            price_yoy_range = None
+            if show_pxyoy:
+                try:
+                    price_yoy_range = fetch_quarterly_avg_price_yoy_us(api_token, sid, rev_range)
+                except Exception:
+                    pass  # 均價YoY抓不到就顯示無資料，不影響其他分析
             data = enrich(raw_data)
             tr, kl, ma_, vl = score_trend(data), score_kline(data), score_ma(data), score_vol(data)
             pb = check_pullback_buy(data)
             pt = detect_patterns(data, pb)
             total_score = tr["score"] + kl["score"] + ma_["score"] + vl["score"]
             batch_results.append({"stockId": sid, "name": name, "data": data, "tr": tr, "kl": kl,
-                                   "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score})
+                                   "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score,
+                                   "peRange": pe_range, "revRange": rev_range, "priceYoYRange": price_yoy_range})
             with log_box:
                 st.caption(f"✅ {sid} {name}　得分:{total_score}")
         except Exception as ex:
@@ -2197,13 +2491,75 @@ else:
         last = r["data"][-1]
         prev = r["data"][-2] if len(r["data"]) >= 2 else last
         chgp = (last["close"] - prev["close"]) / prev["close"] * 100 if prev["close"] else 0
-        return {
+
+        pe = r.get("peRange")
+        pe_txt = "無資料"
+        if pe:
+            pe_txt = f"{pe['current']:.1f}（{pe['min']:.1f}~{pe['max']:.1f}）"
+
+        def fmt_q_pct(entries, field):
+            if not entries:
+                return "無資料"
+            latest = entries[-1]
+            v = latest.get(field)
+            main = f"Q{latest['quarter']} {'+' if v is not None and v >= 0 else ''}{v:.1f}%" if v is not None else f"Q{latest['quarter']} N/A"
+            prior = list(reversed(entries[:-1]))
+            sub_parts = []
+            for e in prior:
+                ev = e.get(field)
+                sub_parts.append(f"Q{e['quarter']} " + (f"{'+' if ev>=0 else ''}{ev:.1f}%" if ev is not None else "N/A"))
+            return main + ("　" + "　".join(sub_parts) if sub_parts else "")
+
+        rev = r.get("revRange")
+        px_range = r.get("priceYoYRange")
+        yoy_txt = fmt_q_pct(rev, "yoy")
+        qoq_txt = fmt_q_pct(rev, "qoq")
+        pxyoy_txt = fmt_q_pct(px_range, "yoy")
+
+        # YoY乖離度＝營收YoY − 均價YoY，3季都算（不是只算最新季）。
+        # 用(year,quarter)配對，不用陣列位置對應，避免兩邊季度萬一沒對齊時算錯。
+        # 正值大＝營收成長比股價快；負值大＝股價漲幅超前營收成長。不用多打API，純算既有資料。
+        div_txt = "需同時勾營收與均價YoY"
+        if rev and px_range:
+            px_by_key = {(p["year"], p["quarter"]): p for p in px_range}
+            div_list = []
+            for rv_e in rev:
+                px_e = px_by_key.get((rv_e["year"], rv_e["quarter"]))
+                d = (rv_e["yoy"] - px_e["yoy"]) if (rv_e.get("yoy") is not None and px_e and px_e.get("yoy") is not None) else None
+                div_list.append({"quarter": rv_e["quarter"], "div": d})
+
+            def fmt_div_q(d):
+                return f"{'+' if d>=0 else ''}{d:.1f}pp" if d is not None else "N/A"
+
+            latest_d = div_list[-1]
+            prior_d = list(reversed(div_list[:-1]))
+            if latest_d["div"] is not None:
+                lbl = ("💚 營收優於股價" if latest_d["div"] > 15
+                       else "⚠️ 股價超前營收" if latest_d["div"] < -15 else "大致同步")
+                main = f"Q{latest_d['quarter']} {fmt_div_q(latest_d['div'])}　{lbl}"
+            else:
+                main = f"Q{latest_d['quarter']} N/A"
+            sub_parts = [f"Q{d['quarter']} {fmt_div_q(d['div'])}" for d in prior_d]
+            div_txt = main + ("　" + "　".join(sub_parts) if sub_parts else "")
+
+        row = {
             "_idx": i, "股票": f"{r['stockId']} {r['name']}", "總分": r["total"], "評等": score_lbl,
             "趨勢": r["tr"]["score"], "K線": r["kl"]["score"], "均線": r["ma"]["score"], "成交量": r["vl"]["score"],
             "漲跌%": round(chgp, 2), "收盤": f"${last['close']:.2f}",
-            "回後買進場": ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt,
-            "型態確認": f"{pt_icon} {pt_txt}",
         }
+        if show_pe:
+            row["近3年P/E區間"] = pe_txt
+        if show_rev:
+            row["近3季營收YoY"] = yoy_txt
+        if show_pxyoy:
+            row["近3季均價YoY"] = pxyoy_txt
+        if show_rev and show_pxyoy:
+            row["YoY乖離度"] = div_txt
+        if show_rev:
+            row["近3季營收QoQ"] = qoq_txt
+        row["回後買進場"] = ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt
+        row["型態確認"] = f"{pt_icon} {pt_txt}"
+        return row
 
     def row_passes_filter(r):
         ok_pb = pb_filter == "全部" or (pb_filter == "✅ 符合進場" and r["pb"]["allPass"]) or (pb_filter == "❌ 不符合" and not r["pb"]["allPass"])
@@ -2356,6 +2712,13 @@ else:
                     ai_text = run_ai_analysis(r, openai_key, openai_model)
                 st.markdown(ai_text)
 
+        if st.button("🏦 載入分析師評等／目標價／內部人交易", key=f"fund_btn_{r['stockId']}"):
+            if not api_token:
+                st.warning("請先在左側輸入 FMP API Key。")
+            else:
+                with st.spinner("正在抓取分析師評等、目標價與內部人交易資料…"):
+                    render_analyst_fundamentals(api_token, r["stockId"])
+
         st.divider()
         st.markdown("### 🎯 回後買上漲 · 進場條件核對")
         if r["pb"]["allPass"]:
@@ -2411,6 +2774,35 @@ else:
                                      "股價偏離": f"{diff:+.2f}% ({'上方' if diff > 0 else '下方'})"})
             st.dataframe(pd.DataFrame(ma_rows), hide_index=True, use_container_width=True)
 
+        ic4, ic5 = st.columns(2)
+        with ic4:
+            st.write("**MACD 指標**")
+            if last.get("macd") is not None and last.get("macdSig") is not None:
+                macd_bull = last["macd"] > last["macdSig"]
+                cross = ""
+                if prev.get("macd") is not None and prev.get("macdSig") is not None:
+                    if prev["macd"] <= prev["macdSig"] and last["macd"] > last["macdSig"]:
+                        cross = "　⚡ 黃金交叉"
+                    elif prev["macd"] >= prev["macdSig"] and last["macd"] < last["macdSig"]:
+                        cross = "　⚡ 死亡交叉"
+                st.markdown(f"DIF=**{last['macd']:.2f}**　Signal=**{last['macdSig']:.2f}**　柱狀=**{last['macdHist']:.2f}**")
+                st.caption(("DIF在Signal上方，偏多" if macd_bull else "DIF在Signal下方，偏空") + cross)
+            else:
+                st.caption("資料不足")
+        with ic5:
+            st.write("**布林通道**")
+            if last.get("bbU") is not None and last.get("bbL") is not None:
+                bb_width = last["bbU"] - last["bbL"]
+                bb_pos = ((last["close"] - last["bbL"]) / bb_width * 100) if bb_width else 50
+                bb_width_pct = (bb_width / last["close"] * 100) if last["close"] else 0
+                st.markdown(f"上軌=**{last['bbU']:.2f}**　下軌=**{last['bbL']:.2f}**")
+                bb_lbl = "⚠️ 貼近上軌，注意過熱回檔" if bb_pos > 80 else ("💚 貼近下軌，留意反彈" if bb_pos < 20 else "位於通道中段")
+                if bb_width_pct < 8:
+                    bb_lbl += "　🔸通道收窄，留意變盤"
+                st.caption(f"股價位置：{bb_pos:.0f}%（通道寬度 {bb_width_pct:.1f}%）　{bb_lbl}")
+            else:
+                st.caption("資料不足")
+
         st.divider()
         st.markdown("### 📉 技術分析圖表")
         st.plotly_chart(draw_chart(r["data"], f"{r['stockId']} {r['name']}", r["pt"]), use_container_width=True)
@@ -2427,5 +2819,9 @@ else:
                     "RSI": round(d["rsi"], 2) if d["rsi"] is not None else None,
                     "KD-K": round(d["kdK"], 2) if d["kdK"] is not None else None,
                     "KD-D": round(d["kdD"], 2) if d["kdD"] is not None else None,
+                    "MACD": round(d["macd"], 2) if d.get("macd") is not None else None,
+                    "Signal": round(d["macdSig"], 2) if d.get("macdSig") is not None else None,
+                    "BB上軌": round(d["bbU"], 2) if d.get("bbU") is not None else None,
+                    "BB下軌": round(d["bbL"], 2) if d.get("bbL") is not None else None,
                 })
             st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
