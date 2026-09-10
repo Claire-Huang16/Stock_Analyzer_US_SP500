@@ -637,14 +637,28 @@ def fetch_price_data(stock_id: str, token: str, days: int):
 # FMP的季度P/E欄位名稱在不同版本文件間出現過 priceToEarningsRatio／priceEarningsRatio
 # 兩種說法，這裡兩個都相容處理。過濾掉0/負值/非數字（虧損股常見），取這3年內的最大
 # 最小值作為區間，最新一筆視為目前P/E。
+# ── 近3年 P/E 區間（/stable/ratios，年頻資料，每股票每次批次分析都會多打一次API）──
+# 原本用 period=quarter（季頻）想要更細的區間，但這帳號的FMP方案回傳 HTTP 402
+# 「Premium Query Parameter: period」——quarter顆粒度被鎖在更高階方案，改用
+# period=annual（年頻，通常基本方案就有）。代價是資料點變少（3年=3筆，不是quarter
+# 版的約12+筆），P/E區間會抓得比較粗略，但至少能動。
+# 欄位名稱是 priceToEarningsRatio（已跟FMP官方範例JSON核對過），仍相容
+# priceEarningsRatio／peRatio 這兩個備用寫法以防萬一。
+# 重點：以前抓不到資料時是直接吞掉錯誤回傳None，看不出是API被擋、帳號方案沒開通、
+# 還是該股票真的沒有這項資料。現在全部改丟出明確錯誤訊息（RuntimeError），讓呼叫端
+# 能把實際原因記下來顯示給使用者看。
 def fetch_pe_range_us(token: str, symbol: str, years: int = 3):
     sym = to_fmp_symbol(symbol)
-    limit = years * 4 + 4
-    url = f"{FMP_BASE}/ratios?symbol={sym}&period=quarter&limit={limit}&apikey={token}"
-    rows = api_fetch(url)
+    limit = years + 1
+    url = f"{FMP_BASE}/ratios?symbol={sym}&period=annual&limit={limit}&apikey={token}"
+    resp = requests.get(url, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"HTTP {resp.status_code}：{resp.text[:200]}")
+    rows = resp.json()
     if not isinstance(rows, list) or not rows:
-        return None
+        raise RuntimeError("回傳空陣列（可能此帳號方案未開通 /ratios 端點，或該股票無財務比率資料）")
     rows = sorted(rows, key=lambda r: str(r.get("date", "")))
+    sample_keys = ",".join(rows[0].keys())
     values = []
     for r in rows:
         v = r.get("priceToEarningsRatio")
@@ -659,7 +673,7 @@ def fetch_pe_range_us(token: str, symbol: str, years: int = 3):
         except (TypeError, ValueError):
             continue
     if not values:
-        return None
+        raise RuntimeError(f"取得 {len(rows)} 筆資料，但解析不出P/E欄位（欄位範例：{sample_keys}）")
     return {"min": min(values), "max": max(values), "current": values[-1]}
 
 
@@ -2303,8 +2317,7 @@ with st.sidebar:
     stock_text = st.text_area("每行一個，或逗號分隔（例：AAPL、MSFT、NVDA）",
                                height=180, key="stock_text_input")
 
-    save_col1, save_col2 = st.columns(2)
-    if save_col1.button("💾 更新我的清單", use_container_width=True):
+    if st.button("💾 更新我的清單", use_container_width=True):
         stocks = parse_stock_tokens(stock_text)
         if stocks:
             st.session_state.custom_lists["my"] = stocks
@@ -2312,22 +2325,20 @@ with st.sidebar:
             st.success(f"已更新我的清單（{len(stocks)}檔）")
         else:
             st.warning("批次股票代號目前是空的，沒有可儲存的內容")
-    if save_col2.button("➕ 存為清單1/2/3", use_container_width=True):
-        stocks = parse_stock_tokens(stock_text)
-        if stocks:
-            target = next((k for k in ("my1", "my2", "my3") if not st.session_state.custom_lists.get(k)), None)
-            overwritten = target is None
-            if overwritten:
-                target = "my1"  # 三槽都滿了，覆蓋清單1（最舊的）
-            st.session_state.custom_lists[target] = stocks
-            save_custom_lists(st.session_state.custom_lists)
-            label = CUSTOM_LIST_LABELS[target]
-            if overwritten:
-                st.warning(f"三槽已滿，已覆蓋{label}（{len(stocks)}檔）")
+
+    # 存為清單1／清單2／清單3：三個各自獨立的按鈕，直接存進指定槽位（不再是舊版
+    # 「自動找空槽」的邏輯）。Streamlit沒有原生confirm彈窗，所以跟清單的×清除鈕一樣，
+    # 按下就直接覆蓋，不會另外跳確認。
+    save_cols = st.columns(3)
+    for idx, key in enumerate(("my1", "my2", "my3")):
+        if save_cols[idx].button(f"➕ 存為清單{idx+1}", use_container_width=True, key=f"save_{key}"):
+            stocks = parse_stock_tokens(stock_text)
+            if stocks:
+                st.session_state.custom_lists[key] = stocks
+                save_custom_lists(st.session_state.custom_lists)
+                st.success(f"已存入{CUSTOM_LIST_LABELS[key]}（{len(stocks)}檔）")
             else:
-                st.success(f"已存入{label}（{len(stocks)}檔）")
-        else:
-            st.warning("批次股票代號目前是空的，沒有可儲存的內容")
+                st.warning("批次股票代號目前是空的，沒有可儲存的內容")
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
 
@@ -2415,12 +2426,12 @@ def run_batch_analysis():
                 key=lambda x: x["date"],
             )
             name = fetch_company_name(api_token, sid)
-            pe_range = None
+            pe_range, pe_range_err = None, None
             if show_pe:
                 try:
                     pe_range = fetch_pe_range_us(api_token, sid, 3)
-                except Exception:
-                    pass  # P/E抓不到就顯示無資料，不影響其他分析
+                except Exception as pe_err:
+                    pe_range_err = str(pe_err)
             rev_range = None
             if show_rev:
                 try:
@@ -2440,8 +2451,11 @@ def run_batch_analysis():
             total_score = tr["score"] + kl["score"] + ma_["score"] + vl["score"]
             batch_results.append({"stockId": sid, "name": name, "data": data, "tr": tr, "kl": kl,
                                    "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score,
-                                   "peRange": pe_range, "revRange": rev_range, "priceYoYRange": price_yoy_range})
+                                   "peRange": pe_range, "peRangeErr": pe_range_err,
+                                   "revRange": rev_range, "priceYoYRange": price_yoy_range})
             with log_box:
+                if pe_range_err:
+                    st.caption(f"⚠️ {sid} P/E區間讀取失敗：{pe_range_err}")
                 st.caption(f"✅ {sid} {name}　得分:{total_score}")
         except Exception as ex:
             with log_box:
@@ -2496,6 +2510,8 @@ else:
         pe_txt = "無資料"
         if pe:
             pe_txt = f"{pe['current']:.1f}（{pe['min']:.1f}~{pe['max']:.1f}）"
+        elif r.get("peRangeErr"):
+            pe_txt = f"⚠️ 讀取失敗：{r['peRangeErr']}"
 
         def fmt_q_pct(entries, field):
             if not entries:
