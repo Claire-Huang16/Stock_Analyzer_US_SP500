@@ -14,6 +14,7 @@ US技術分析全攻略 · 美股評分分析系統 (Streamlit 版)
 import time
 import json
 import os
+import io
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -1226,6 +1227,111 @@ def score_vol(data):
 
 
 # ────────────────────────────────────────────────────────────────
+# DMI（趨向指標，Wilder 原始方法）＋多方力道評分（0-100，取代朱家泓四維度總分）
+# ────────────────────────────────────────────────────────────────
+
+def calc_dmi(data, period=14):
+    """+DI／-DI衡量上升與下降方向的動能強弱，ADX衡量趨勢強度（不分方向），
+    ADXR是ADX跟N天前ADX的平均，用來看趨勢是在增強還是減弱。用Wilder's smoothing
+    對TR／+DM／-DM做平滑化（是對累計總和做平滑，不是簡單移動平均——這是DMI的
+    標準算法，跟MACD用的EMA不同）。"""
+    n = len(data)
+    if n < period + 1:
+        return None
+
+    plus_dm, minus_dm, tr = [], [], []
+    for i in range(1, n):
+        up_move = data[i]["high"] - data[i - 1]["high"]
+        down_move = data[i - 1]["low"] - data[i]["low"]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
+        tr.append(max(
+            data[i]["high"] - data[i]["low"],
+            abs(data[i]["high"] - data[i - 1]["close"]),
+            abs(data[i]["low"] - data[i - 1]["close"]),
+        ))
+    if len(tr) < period:
+        return None
+
+    def wilder_sum(arr, p):
+        out = []
+        s = sum(arr[:p])
+        out.append(s)
+        for j in range(p, len(arr)):
+            s = s - s / p + arr[j]
+            out.append(s)
+        return out
+
+    sm_tr = wilder_sum(tr, period)
+    sm_plus_dm = wilder_sum(plus_dm, period)
+    sm_minus_dm = wilder_sum(minus_dm, period)
+
+    plus_di = [(v / sm_tr[i] * 100) if sm_tr[i] else 0 for i, v in enumerate(sm_plus_dm)]
+    minus_di = [(v / sm_tr[i] * 100) if sm_tr[i] else 0 for i, v in enumerate(sm_minus_dm)]
+    dx = []
+    for i, v in enumerate(plus_di):
+        s = v + minus_di[i]
+        dx.append(abs(v - minus_di[i]) / s * 100 if s else 0)
+
+    adx = None
+    if len(dx) >= period:
+        adx = []
+        avg = sum(dx[:period]) / period
+        adx.append(avg)
+        for k in range(period, len(dx)):
+            avg = (avg * (period - 1) + dx[k]) / period
+            adx.append(avg)
+
+    adxr = None
+    if adx and len(adx) > period:
+        adxr = [(adx[m] + adx[m - period]) / 2 for m in range(period, len(adx))]
+
+    return {
+        "plusDI": plus_di[-1],
+        "minusDI": minus_di[-1],
+        "adx": adx[-1] if adx else None,
+        "adxr": adxr[-1] if adxr else None,
+    }
+
+
+def score_dmi(dmi):
+    """多方力道評分（0-100）：①方向性（+DI相對-DI的優勢程度，最高50分）
+    ②趨勢強度（ADX，最高30分）③趨勢轉強加分（ADX>ADXR，20分）。
+    DMI資料不足（新股/資料太短）時各項給0分，不是「無資料」而是保守給0分，
+    因為總分要能排序／篩選，不能是非數值。"""
+    if not dmi or dmi.get("plusDI") is None or dmi.get("minusDI") is None:
+        return {"score": 0, "max": 100, "plusDI": None, "minusDI": None, "adx": None, "adxr": None,
+                "diPts": 0, "adxPts": 0, "adxrPts": 0, "tdir": "資料不足",
+                "sigs": [("DMI資料不足（可能資料天數太短）", "neu")]}
+
+    plus_di, minus_di = dmi["plusDI"], dmi["minusDI"]
+    adx, adxr = dmi.get("adx"), dmi.get("adxr")
+
+    di_sum = plus_di + minus_di
+    di_dominance_pct = (plus_di / di_sum * 100) if di_sum else 50  # 50%=中性，100%=完全多方主導
+    di_pts = di_dominance_pct * 0.5  # 0-50分
+    adx_pts = (min(adx, 40) / 40 * 30) if adx is not None else 0  # 0-30分，ADX≥40視為滿分
+    adxr_pts = 20 if (adx is not None and adxr is not None and adx > adxr) else 0  # 0或20分
+    score = round(max(0, min(100, di_pts + adx_pts + adxr_pts)))
+
+    bullish = plus_di > minus_di
+    tdir = "多頭" if bullish else ("空頭" if plus_di < minus_di else "盤整")
+
+    sigs = [(f"+DI {plus_di:.1f}{'>' if bullish else '<'}-DI {minus_di:.1f}（多方力道{'較強' if bullish else '較弱'}）",
+             "bull" if bullish else "bear")]
+    if adx is not None:
+        adx_lbl = "趨勢明確" if adx >= 25 else ("趨勢成形中" if adx >= 20 else "盤整")
+        sigs.append((f"ADX {adx:.1f}（{adx_lbl}）", "bull" if adx >= 25 else "neu"))
+    if adx is not None and adxr is not None:
+        strengthening = adx > adxr
+        sigs.append((f"ADX{'>' if strengthening else '<'}ADXR，趨勢{'轉強' if strengthening else '轉弱'}",
+                     "bull" if strengthening else "bear"))
+
+    return {"score": score, "max": 100, "plusDI": plus_di, "minusDI": minus_di, "adx": adx, "adxr": adxr,
+            "diPts": di_pts, "adxPts": adx_pts, "adxrPts": adxr_pts, "tdir": tdir, "sigs": sigs}
+
+
+# ────────────────────────────────────────────────────────────────
 # 回後買上漲 8 條件核對
 # ────────────────────────────────────────────────────────────────
 
@@ -2052,9 +2158,13 @@ def build_analysis_prompt(r):
         bb_p = ((last["close"] - last["bbL"]) / bb_w * 100) if bb_w else 50
         lines.append(f"布林通道：上軌={last['bbU']:.2f}　下軌={last['bbL']:.2f}　股價位置={bb_p:.0f}%")
     lines.append("")
-    lines.append(f"【朱家泓四維度評分】總分 {r['total']}/100")
-    lines.append(f"趨勢 {r['tr']['score']}/25、K線 {r['kl']['score']}/25、均線 {r['ma']['score']}/25、成交量 {r['vl']['score']}/25")
-    all_sigs = r["tr"]["sigs"] + r["kl"]["sigs"] + r["ma"]["sigs"] + r["vl"]["sigs"]
+    lines.append(f"【DMI多方力道評分】總分 {r['total']}/100")
+    dm = r["dm"]
+    lines.append(f"+DI={dm['plusDI']:.1f}　-DI={dm['minusDI']:.1f}　ADX={dm['adx']:.1f}　ADXR={dm['adxr']:.1f}"
+                 if dm["plusDI"] is not None and dm["adx"] is not None and dm["adxr"] is not None
+                 else "DMI資料不足")
+    lines.append(f"方向性 {dm['diPts']:.1f}/50、趨勢強度 {dm['adxPts']:.1f}/30、趨勢動能 {dm['adxrPts']:.1f}/20")
+    all_sigs = dm["sigs"]
     bull_sigs = [s[0] for s in all_sigs if s[1] == "bull"]
     bear_sigs = [s[0] for s in all_sigs if s[1] == "bear"]
     if bull_sigs:
@@ -2082,7 +2192,7 @@ def run_ai_analysis(r, api_key, model):
                 "temperature": 0.4,
                 "max_tokens": 900,
                 "messages": [
-                    {"role": "system", "content": "你是一位精通美股技術分析的資深操盤手，熟悉朱家泓《技術分析全攻略》方法論（趨勢轉折波、K線、均線、成交量四維度評分，以及回後買上漲、頭肩底等進場型態），並將此方法論套用於美國股市個股分析。請根據使用者提供的個股技術數據摘要，用繁體中文給出：1) 整體技術面研判（3-4句） 2) 進場時機與風險提示 3) 綜合建議（積極做多／可考慮／觀望／不建議）。語氣專業、精簡、避免空泛用詞，並提醒這僅為技術面參考，非投資建議，且未考慮美股盤前盤後交易、財報公布時程等因素。"},
+                    {"role": "system", "content": "你是一位精通美股技術分析的資深操盤手，熟悉DMI趨向指標（+DI／-DI／ADX／ADXR）多方力道評分方法論，以及朱家泓《技術分析全攻略》的回後買上漲、頭肩底等進場型態判斷，並將此方法論套用於美國股市個股分析。請根據使用者提供的個股技術數據摘要，用繁體中文給出：1) 整體技術面研判（3-4句） 2) 進場時機與風險提示 3) 綜合建議（積極做多／可考慮／觀望／不建議）。語氣專業、精簡、避免空泛用詞，並提醒這僅為技術面參考，非投資建議，且未考慮美股盤前盤後交易、財報公布時程等因素。"},
                     {"role": "user", "content": prompt},
                 ],
             },
@@ -2110,7 +2220,7 @@ if "custom_lists" not in st.session_state:
     st.session_state.custom_lists = load_custom_lists()
 
 st.title("📊 US技術分析全攻略 · 美股評分分析系統")
-st.caption("依據朱家泓《技術分析全攻略》課程方法論，從趨勢、K線、均線、成交量四大維度評分（美股版，資料來源：Financial Modeling Prep）")
+st.caption("個股評分改為DMI趨向指標（+DI／-DI／ADX／ADXR）多方力道評分；回後買上漲、15種進場型態辨識仍沿用朱家泓《技術分析全攻略》方法論（美股版，資料來源：Financial Modeling Prep）")
 
 
 def fetch_etf_set(token):
@@ -2445,12 +2555,13 @@ def run_batch_analysis():
                 except Exception:
                     pass  # 均價YoY抓不到就顯示無資料，不影響其他分析
             data = enrich(raw_data)
-            tr, kl, ma_, vl = score_trend(data), score_kline(data), score_ma(data), score_vol(data)
+            dmi = calc_dmi(data, 14)
+            dm = score_dmi(dmi)
             pb = check_pullback_buy(data)
             pt = detect_patterns(data, pb)
-            total_score = tr["score"] + kl["score"] + ma_["score"] + vl["score"]
-            batch_results.append({"stockId": sid, "name": name, "data": data, "tr": tr, "kl": kl,
-                                   "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score,
+            total_score = dm["score"]
+            batch_results.append({"stockId": sid, "name": name, "data": data, "dm": dm,
+                                   "pb": pb, "pt": pt, "total": total_score,
                                    "peRange": pe_range, "peRangeErr": pe_range_err,
                                    "revRange": rev_range, "priceYoYRange": price_yoy_range})
             with log_box:
@@ -2558,9 +2669,13 @@ else:
             sub_parts = [f"Q{d['quarter']} {fmt_div_q(d['div'])}" for d in prior_d]
             div_txt = main + ("　" + "　".join(sub_parts) if sub_parts else "")
 
+        dm = r["dm"]
         row = {
-            "_idx": i, "股票": f"{r['stockId']} {r['name']}", "總分": r["total"], "評等": score_lbl,
-            "趨勢": r["tr"]["score"], "K線": r["kl"]["score"], "均線": r["ma"]["score"], "成交量": r["vl"]["score"],
+            "_idx": i, "股票": f"{r['stockId']} {r['name']}", "多方力道": r["total"], "評等": score_lbl,
+            "+DI": round(dm["plusDI"], 1) if dm["plusDI"] is not None else None,
+            "-DI": round(dm["minusDI"], 1) if dm["minusDI"] is not None else None,
+            "ADX": round(dm["adx"], 1) if dm["adx"] is not None else None,
+            "ADXR": round(dm["adxr"], 1) if dm["adxr"] is not None else None,
             "漲跌%": round(chgp, 2), "收盤": f"${last['close']:.2f}",
         }
         if show_pe:
@@ -2605,6 +2720,21 @@ else:
             df_summary.drop(columns=["_idx"]), use_container_width=True, hide_index=True, height=360,
         )
 
+        # 匯出Excel：跟畫面上的表格一致——目前的篩選、排序後的資料都會反映在匯出結果裡。
+        # 需要 openpyxl 套件（pandas寫.xlsx用的引擎），環境裡沒裝的話這裡會噴錯，
+        # 跑 `pip install openpyxl` 補上即可。
+        try:
+            excel_buf = io.BytesIO()
+            df_summary.drop(columns=["_idx"]).to_excel(excel_buf, index=False, engine="openpyxl", sheet_name="批次分析摘要")
+            st.download_button(
+                "📥 匯出 Excel",
+                data=excel_buf.getvalue(),
+                file_name=f"批次分析摘要_{datetime.today().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except ImportError:
+            st.caption("⚠️ 匯出Excel需要 openpyxl 套件，請先執行 `pip install openpyxl`")
+
         # 選擇要看詳細分析的股票（取代原本 HTML 版的分頁 tab）
         options = [f"{r['stockId']} {r['name']}（{r['total']}分）" for r in batch_results]
         default_idx = st.session_state.get("selected_stock_idx", 0)
@@ -2639,79 +2769,81 @@ else:
         m4.metric("資料日期", last["date"])
 
         st.divider()
-        st.markdown("### 📊 綜合評分")
+        st.markdown("### 📊 多方力道評分")
         sc1, sc2 = st.columns([1, 2])
         with sc1:
             st.markdown(
                 f"<div style='text-align:center;background:linear-gradient(135deg,#1a1a2e,#16213e);"
                 f"border-radius:16px;padding:28px 16px;border:1px solid rgba(255,255,255,.1)'>"
                 f"<div style='font-size:64px;font-weight:700;color:{vc}'>{total}</div>"
-                f"<div style='font-size:12px;color:#888;margin-top:6px'>綜合評分 / 100</div>"
+                f"<div style='font-size:12px;color:#888;margin-top:6px'>多方力道 / 100</div>"
                 f"<div style='margin-top:12px;display:inline-block;padding:7px 16px;border-radius:8px;"
                 f"background:{vc}22;color:{vc};font-weight:700'>{vt}</div></div>",
                 unsafe_allow_html=True,
             )
         with sc2:
-            dims = [("📈 趨勢分析", r["tr"], "轉折波・多空頭辨別"), ("🕯️ K線型態", r["kl"], "K線組合・變盤訊號"),
-                    ("📊 均線系統", r["ma"], "葛蘭畢・多空排列"), ("📦 成交量", r["vl"], "量價關係・量能確認")]
-            for t, dr, d in dims:
-                pct = dr["score"] / dr["max"] * 100
+            dm = r["dm"]
+            dims = [("🧭 方向性 (+DI vs -DI)", dm["diPts"], 50, "+DI相對-DI的優勢程度"),
+                    ("💪 趨勢強度 (ADX)", dm["adxPts"], 30, "ADX值，越高趨勢越明確"),
+                    ("🚀 趨勢動能 (ADX vs ADXR)", dm["adxrPts"], 20, "ADX>ADXR代表趨勢正在轉強")]
+            for t, score_val, max_val, d in dims:
+                pct = score_val / max_val * 100 if max_val else 0
                 col = "#00c864" if pct >= 70 else "#f0a500" if pct >= 40 else "#ff3c3c"
                 st.markdown(
                     f"<div style='background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);"
                     f"border-radius:10px;padding:10px 14px;margin-bottom:6px'>"
                     f"<div style='display:flex;justify-content:space-between;align-items:center'>"
                     f"<div><div style='font-size:12px;color:#888'>{t}</div><div style='font-size:11px;color:#666'>{d}</div></div>"
-                    f"<div style='font-size:22px;font-weight:700;color:{col}'>{dr['score']}<span style='font-size:11px;color:#555'>/{dr['max']}</span></div>"
+                    f"<div style='font-size:22px;font-weight:700;color:{col}'>{score_val:.1f}<span style='font-size:11px;color:#555'>/{max_val}</span></div>"
                     f"</div><div style='background:rgba(255,255,255,.05);border-radius:4px;height:5px;margin-top:6px'>"
                     f"<div style='background:{col};border-radius:4px;height:5px;width:{pct}%'></div></div></div>",
                     unsafe_allow_html=True,
                 )
+            if dm["plusDI"] is not None:
+                st.caption(f"+DI={dm['plusDI']:.1f}　-DI={dm['minusDI']:.1f}　"
+                           f"ADX={dm['adx']:.1f}　ADXR={dm['adxr']:.1f}" if dm["adx"] is not None and dm["adxr"] is not None
+                           else f"+DI={dm['plusDI']:.1f}　-DI={dm['minusDI']:.1f}")
 
         st.divider()
-        st.markdown("### 🔔 技術訊號")
-        sig_cols = st.columns(4)
-        for col, (t, sigs) in zip(sig_cols, [("趨勢訊號", r["tr"]["sigs"]), ("K線訊號", r["kl"]["sigs"]),
-                                              ("均線訊號", r["ma"]["sigs"]), ("成交量訊號", r["vl"]["sigs"])]):
-            with col:
-                st.markdown(f"**{t}**")
-                if sigs:
-                    for label, kind in sigs:
-                        color = "#00c864" if kind == "bull" else "#ff5555" if kind == "bear" else "#aaa"
-                        st.markdown(f"<span style='display:inline-block;padding:2px 8px;border-radius:12px;"
-                                    f"font-size:11px;color:{color};border:1px solid {color}55;margin:2px'>{label}</span>",
-                                    unsafe_allow_html=True)
-                else:
-                    st.caption("無明顯訊號")
+        st.markdown("### 🔔 DMI訊號")
+        dm_sigs = r["dm"]["sigs"]
+        if dm_sigs:
+            for label, kind in dm_sigs:
+                color = "#00c864" if kind == "bull" else "#ff5555" if kind == "bear" else "#aaa"
+                st.markdown(f"<span style='display:inline-block;padding:2px 8px;border-radius:12px;"
+                            f"font-size:11px;color:{color};border:1px solid {color}55;margin:2px'>{label}</span>",
+                            unsafe_allow_html=True)
+        else:
+            st.caption("無明顯訊號")
 
         st.divider()
         st.markdown("### 💡 操作建議")
+        dm = r["dm"]
         if total >= 80:
-            act, adv = "🟢 積極做多", [f"**{r['name']}** 綜合評分 {total} 分，技術面強勢，建議積極做多。"]
-            if r["tr"]["tdir"] == "多頭":
-                adv.append("趨勢確立多頭，順勢操作，逢低分批佈局。")
+            act, adv = "🟢 積極做多", [f"**{r['name']}** 多方力道評分 {total} 分，DMI顯示多方力道強勁，建議積極做多。"]
+            if dm["tdir"] == "多頭":
+                adv.append("+DI大於-DI且趨勢轉強，順勢操作，逢低分批佈局。")
             ma20v = last["ma20"] or last["close"]
             bb_up = last["bbU"] or last["close"] * 1.1
             sl = f"停損設於 **${ma20v * 0.97:.2f}**（20MA下方3%）"
             tgt = f"目標參考 **${last['close'] * ((bb_up - last['close']) / last['close'] + 1):.2f}**（布林上軌）"
         elif total >= 65:
-            act, adv = "🔵 可考慮進場", [f"**{r['name']}** 評分 {total} 分，技術面偏多，可考慮分批進場。", "建議等待回測均線後再進場，降低風險。"]
+            act, adv = "🔵 可考慮進場", [f"**{r['name']}** 評分 {total} 分，DMI偏多，可考慮分批進場。", "建議等待回測均線後再進場，降低風險。"]
             ma20v = last["ma20"] or last["close"]
             sl = f"停損建議 **${ma20v * 0.98:.2f}**（20MA下方2%）"
             tgt = f"短線目標 **${last['close'] * 1.08:.2f}**（+8%）"
         elif total >= 50:
-            act, adv = "🟡 觀望為主", [f"**{r['name']}** 評分 {total} 分，技術面訊號混雜，建議觀望。", "等待均線整理完畢或趨勢明確後再行動。"]
+            act, adv = "🟡 觀望為主", [f"**{r['name']}** 評分 {total} 分，DMI訊號混雜或趨勢不明確，建議觀望。", "等待ADX轉強或+DI/-DI方向明確後再行動。"]
             sl, tgt = "暫不建議進場", "等待更佳時機"
         else:
-            act, adv = "🔴 不適合進場", [f"**{r['name']}** 評分 {total} 分，技術面偏空，不建議進場。"]
-            if r["tr"]["tdir"] == "空頭":
-                adv.append("目前空頭趨勢，切忌逆勢做多，等待趨勢反轉。")
+            act, adv = "🔴 不適合進場", [f"**{r['name']}** 評分 {total} 分，DMI偏空，不建議進場。"]
+            if dm["tdir"] == "空頭":
+                adv.append("目前-DI大於+DI，空方力道較強，切忌逆勢做多，等待趨勢反轉。")
             else:
-                adv.append("技術指標偏弱，應持現金等待機會。")
+                adv.append("DMI指標偏弱或資料不足，應持現金等待機會。")
             sl, tgt = "持倉者建議設停損出場", "等待多頭訊號出現"
 
-        all_sigs = r["tr"]["sigs"] + r["kl"]["sigs"] + r["ma"]["sigs"] + r["vl"]["sigs"]
-        hints = [s[0] for s in all_sigs if s[1] == "bull"][:5]
+        hints = [s[0] for s in dm["sigs"] if s[1] == "bull"][:5]
         st.markdown(f"**{act}**")
         for line in adv:
             st.markdown(line)
