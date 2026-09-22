@@ -15,6 +15,7 @@ import time
 import json
 import os
 import io
+import sqlite3
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -634,6 +635,61 @@ def fetch_price_data(stock_id: str, token: str, days: int):
     return rows
 
 
+# ── 相對強弱（vs 大盤）：用SPY（S&P500 ETF）當大盤代理，不用另外接指數API，
+# 直接當一般股票代號抓，同一套 fetch_price_data 就能用。只抓一次，所有股票
+# 共用同一份大盤資料，不是每檔股票都各抓一次。──
+BENCHMARK_ID = "SPY"
+
+
+def fetch_benchmark_series(token: str, days: int):
+    rows = fetch_price_data(BENCHMARK_ID, token, days)
+    arr = sorted(
+        [{"date": d["date"], "close": float(d["close"])} for d in rows],
+        key=lambda x: x["date"],
+    )
+    date_idx = {bar["date"]: i for i, bar in enumerate(arr)}
+    return {"arr": arr, "date_idx": date_idx}
+
+
+def find_benchmark_idx(benchmark: dict, date_str: str):
+    if date_str in benchmark["date_idx"]:
+        return benchmark["date_idx"][date_str]
+    for i in range(len(benchmark["arr"]) - 1, -1, -1):
+        if benchmark["arr"][i]["date"] <= date_str:
+            return i
+    return -1
+
+
+def compute_relative_strength(data, benchmark, lookback: int = 20):
+    """算「股票N日報酬 - 大盤N日報酬」的相對強弱，正值代表跑贏大盤。用20日窗口。"""
+    if not benchmark or not benchmark["arr"] or len(data) <= lookback:
+        return None
+    last = data[-1]
+    prev_bar = data[-1 - lookback]
+    if not prev_bar or not prev_bar.get("close"):
+        return None
+    stock_ret = (last["close"] - prev_bar["close"]) / prev_bar["close"] * 100
+
+    bench_idx = find_benchmark_idx(benchmark, last["date"])
+    if bench_idx < lookback:
+        return None
+    bench_now = benchmark["arr"][bench_idx]
+    bench_prev = benchmark["arr"][bench_idx - lookback]
+    if not bench_prev or not bench_prev.get("close"):
+        return None
+    bench_ret = (bench_now["close"] - bench_prev["close"]) / bench_prev["close"] * 100
+
+    return stock_ret - bench_ret
+
+
+def compute_vol_ratio(data):
+    """成交量確認：當天成交量 ÷ 近20日均量（vm20已經在enrich()裡算好）。"""
+    last = data[-1]
+    if not last.get("vm20"):
+        return None
+    return last["volume"] / last["vm20"]
+
+
 # ── 近3年 P/E 區間（/stable/ratios，季頻資料，每股票每次批次分析都會多打一次API）──
 # FMP的季度P/E欄位名稱在不同版本文件間出現過 priceToEarningsRatio／priceEarningsRatio
 # 兩種說法，這裡兩個都相容處理。過濾掉0/負值/非數字（虧損股常見），取這3年內的最大
@@ -1049,6 +1105,30 @@ def calc_kd(data, period=9):
     return {"k": k_arr, "d": d_arr}
 
 
+# ── KDJ(6,3,3)：跟上面的calc_kd（9,3,3，給K線圖用）是兩套獨立參數，不要共用──
+def calc_kdj(data, period=6, k_n=3, d_n=3):
+    k_arr, d_arr, j_arr = [], [], []
+    prev_k, prev_d = 50.0, 50.0
+    for i in range(len(data)):
+        if i < period - 1:
+            k_arr.append(None)
+            d_arr.append(None)
+            j_arr.append(None)
+            continue
+        window = data[i - period + 1:i + 1]
+        lowest = min(d["low"] for d in window)
+        highest = max(d["high"] for d in window)
+        rsv = 50 if highest == lowest else (data[i]["close"] - lowest) / (highest - lowest) * 100
+        k = prev_k * (k_n - 1) / k_n + rsv * 1 / k_n
+        d = prev_d * (d_n - 1) / d_n + k * 1 / d_n
+        j = 3 * k - 2 * d
+        k_arr.append(k)
+        d_arr.append(d)
+        j_arr.append(j)
+        prev_k, prev_d = k, d
+    return {"k": k_arr, "d": d_arr, "j": j_arr}
+
+
 def enrich(data):
     closes = [d["close"] for d in data]
     volumes = [d["volume"] for d in data]
@@ -1058,6 +1138,7 @@ def enrich(data):
     bbs = calc_bb_series(closes)
     vm5, vm20 = calc_volma(volumes, 5), calc_volma(volumes, 20)
     kd = calc_kd(data, 9)
+    kdj = calc_kdj(data, 6, 3, 3)
     out = []
     for i, d in enumerate(data):
         out.append({
@@ -1068,6 +1149,7 @@ def enrich(data):
             "rsi": rs[i], "bbU": bbs[i]["u"], "bbL": bbs[i]["l"],
             "vm5": vm5[i], "vm20": vm20[i],
             "kdK": kd["k"][i], "kdD": kd["d"][i],
+            "kdjK": kdj["k"][i], "kdjD": kdj["d"][i], "kdjJ": kdj["j"][i],
         })
     return out
 
@@ -1449,6 +1531,93 @@ def _ma_slope_up(data, key, n, last_idx):
     if c[key] is None or p[key] is None:
         return False
     return c[key] > p[key]
+
+
+def compute_core_signals(data, dm):
+    """算出布林通道位置、MACD狀態、強勢突破盤／跌深反彈盤——跟 build_summary_row
+    裡顯示用的邏輯完全一致，這裡抽成獨立函式回傳「原始數值」（不是格式化文字），
+    給快照資料庫寫入用。刻意跟顯示邏輯分開寫（有點重複），避免改動已經在跑的
+    總表顯示邏輯。"""
+    last = data[-1]
+    prev = data[-2] if len(data) >= 2 else last
+
+    bb_pos = None
+    if last.get("bbU") is not None and last.get("bbL") is not None:
+        bb_width = last["bbU"] - last["bbL"]
+        bb_pos = ((last["close"] - last["bbL"]) / bb_width * 100) if bb_width else 50
+
+    macd_state = None
+    is_breakout = False
+    is_pullback_rebound = False
+    golden_cross_recent = False
+    if (last.get("macd") is not None and last.get("macdSig") is not None
+            and last.get("macdHist") is not None and prev.get("macdHist") is not None):
+        above_zero = last["macd"] > 0
+        hist_growing = last["macdHist"] > prev["macdHist"]
+        if above_zero and last["macdHist"] > 0:
+            macd_state = "零軸上・紅柱增長" if hist_growing else "零軸上・紅柱縮短"
+        elif not above_zero and last["macdHist"] < 0:
+            macd_state = "零軸下・綠柱縮短" if hist_growing else "零軸下・綠柱增長"
+        else:
+            macd_state = "交叉轉換中"
+
+        for gci in range(max(1, len(data) - 3), len(data)):
+            gc_cur, gc_prev = data[gci], data[gci - 1]
+            if (gc_cur.get("macd") is not None and gc_cur.get("macdSig") is not None
+                    and gc_prev.get("macd") is not None and gc_prev.get("macdSig") is not None
+                    and gc_prev["macd"] <= gc_prev["macdSig"] and gc_cur["macd"] > gc_cur["macdSig"]):
+                golden_cross_recent = True
+                break
+
+        width_expanding = False
+        if last.get("bbU") is not None and last.get("bbL") is not None:
+            width_now_pct = (last["bbU"] - last["bbL"]) / last["close"] * 100 if last["close"] else 0
+            ref_idx = len(data) - 6
+            ref_bar = data[ref_idx] if ref_idx >= 0 else None
+            if ref_bar and ref_bar.get("bbU") is not None and ref_bar.get("bbL") is not None and ref_bar["close"]:
+                width_ref_pct = (ref_bar["bbU"] - ref_bar["bbL"]) / ref_bar["close"] * 100
+                width_expanding = width_now_pct > width_ref_pct
+
+        is_breakout = (bb_pos is not None and bb_pos >= 80 and width_expanding
+                       and above_zero and last["macdHist"] > 0 and hist_growing)
+
+        divergence_detected = False
+        zz_lows = [p for p in build_zigzag(data) if p["type"] == "L"]
+        if len(zz_lows) >= 2:
+            recent_low, prior_low = zz_lows[-1], zz_lows[-2]
+            within_lookback = recent_low["idx"] >= len(data) - 1 - 60
+            macd_at_recent = data[recent_low["idx"]].get("macd") if recent_low["idx"] < len(data) else None
+            macd_at_prior = data[prior_low["idx"]].get("macd") if prior_low["idx"] < len(data) else None
+            if within_lookback and macd_at_recent is not None and macd_at_prior is not None:
+                divergence_detected = (recent_low["price"] < prior_low["price"]) and (macd_at_recent > macd_at_prior)
+
+        is_pullback_rebound = bb_pos is not None and bb_pos <= 20 and divergence_detected and golden_cross_recent
+
+    # ── KDJ(6,3,3) 黃金交叉／死亡交叉：K由下往上穿越D＝黃金交叉（多方），
+    # K由上往下穿越D＝死亡交叉（空方）。跟MACD黃金交叉用同一套「近3天內」判斷法。
+    kdj_state = None
+    kdj_golden_cross_recent = False
+    kdj_death_cross_recent = False
+    if last.get("kdjK") is not None and last.get("kdjD") is not None:
+        kdj_state = "K>D（多方）" if last["kdjK"] > last["kdjD"] else ("K<D（空方）" if last["kdjK"] < last["kdjD"] else "K=D")
+        for kci in range(max(1, len(data) - 3), len(data)):
+            kc_cur, kc_prev = data[kci], data[kci - 1]
+            if (kc_cur.get("kdjK") is not None and kc_cur.get("kdjD") is not None
+                    and kc_prev.get("kdjK") is not None and kc_prev.get("kdjD") is not None):
+                if kc_prev["kdjK"] <= kc_prev["kdjD"] and kc_cur["kdjK"] > kc_cur["kdjD"]:
+                    kdj_golden_cross_recent = True
+                if kc_prev["kdjK"] >= kc_prev["kdjD"] and kc_cur["kdjK"] < kc_cur["kdjD"]:
+                    kdj_death_cross_recent = True
+        if kdj_golden_cross_recent:
+            kdj_state += "　⚡近3日黃金交叉"
+        if kdj_death_cross_recent:
+            kdj_state += "　💀近3日死亡交叉"
+
+    return {"bb_pos": bb_pos, "macd_state": macd_state,
+            "is_breakout": is_breakout, "is_pullback_rebound": is_pullback_rebound,
+            "golden_cross_recent": golden_cross_recent,
+            "kdj_state": kdj_state, "kdj_golden_cross_recent": kdj_golden_cross_recent,
+            "kdj_death_cross_recent": kdj_death_cross_recent}
 
 
 def detect_patterns(data, pb, skip_just_broke=False):
@@ -2209,6 +2378,768 @@ def run_ai_analysis(r, api_key, model):
 
 
 # ────────────────────────────────────────────────────────────────
+# 歷史回測系統（美股／S&P500）
+# ────────────────────────────────────────────────────────────────
+
+SNAPSHOT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots_us.db")
+
+# ── 回測專用：長時間歷史版本的季度營收抓取，以及「當時已公告」的判斷邏輯──
+# 美股是季報，用「季末+45天」當保守的已公告門檻（美股法規要求大型企業10-Q在
+# 季末後40天內申報、10-K在季末後60-90天內申報，45天是介於中間的保守估計，
+# 不是精確的實際申報日——要抓每檔股票精確的申報日期需要額外一次API查詢，
+# 這裡為了控制API呼叫量選擇用估計值，可能跟實際公告日有一兩週的落差）。
+def fetch_revenue_history_for_backtest_us(stock_id: str, token: str, quarters_back: int):
+    sym = to_fmp_symbol(stock_id)
+    limit = min(40, quarters_back + 4)
+    url = f"{FMP_BASE}/income-statement?symbol={sym}&period=quarter&limit={limit}&apikey={token}"
+    rows = api_fetch(url)
+    if not isinstance(rows, list) or not rows:
+        return {}
+    rev_map = {}
+    for r in rows:
+        d = str(r.get("date", ""))[:10]
+        if len(d) < 7 or r.get("revenue") is None:
+            continue
+        y, mo = int(d[:4]), int(d[5:7])
+        q = (mo - 1) // 3 + 1
+        rev_map[f"{y}-Q{q}"] = r["revenue"]
+    return rev_map
+
+
+def quarter_end_date(year: int, quarter: int) -> datetime:
+    end_month = quarter * 3  # Q1→3月, Q2→6月, Q3→9月, Q4→12月
+    if end_month == 12:
+        return datetime(year, 12, 31)
+    return datetime(year, end_month + 1, 1) - timedelta(days=1)
+
+
+def revenue_known_by_us(year: int, quarter: int, as_of_date_str: str) -> bool:
+    q_end = quarter_end_date(year, quarter)
+    disclose_date = q_end + timedelta(days=45)
+    as_of = datetime.strptime(as_of_date_str, "%Y-%m-%d")
+    return as_of >= disclose_date
+
+
+def last_n_known_quarters_us(as_of_date_str: str, n: int = 1):
+    as_of = datetime.strptime(as_of_date_str, "%Y-%m-%d")
+    y, q = as_of.year, (as_of.month - 1) // 3 + 1
+    result = []
+    for _ in range(8):
+        if revenue_known_by_us(y, q, as_of_date_str):
+            result.append((y, q))
+            if len(result) >= n:
+                break
+        q -= 1
+        if q < 1:
+            q, y = 4, y - 1
+    result.reverse()
+    return result
+
+
+def build_price_quarter_avg_map_us(data):
+    sums, counts = {}, {}
+    for d in data:
+        y, mo = int(d["date"][:4]), int(d["date"][5:7])
+        key = f"{y}-Q{(mo - 1) // 3 + 1}"
+        sums[key] = sums.get(key, 0) + d["close"]
+        counts[key] = counts.get(key, 0) + 1
+    return {k: sums[k] / counts[k] for k in sums}
+
+
+def compute_divergence_asof_us(rev_map: dict, price_quarter_avg_map: dict, eval_date_str: str):
+    """算某個評估日『當下』能看到的近1季營收YoY vs 均價YoY乖離度，以及單獨的均價
+    YoY（美股季報，只用最近1個已公告季度，不像台股月營收可以累加3個月）。
+    回傳 (div_total, price_yoy_total)，都可能是 None。"""
+    quarters = last_n_known_quarters_us(eval_date_str, 1)
+    if not quarters:
+        return None, None
+    y, q = quarters[0]
+    rev_this, rev_last = rev_map.get(f"{y}-Q{q}"), rev_map.get(f"{y-1}-Q{q}")
+    px_this, px_last = price_quarter_avg_map.get(f"{y}-Q{q}"), price_quarter_avg_map.get(f"{y-1}-Q{q}")
+    price_yoy_total = ((px_this - px_last) / px_last * 100) if (px_last and px_this is not None) else None
+    div_total = None
+    if rev_last and rev_this is not None and px_last and px_this is not None:
+        rev_yoy = (rev_this - rev_last) / rev_last * 100
+        div_total = rev_yoy - price_yoy_total
+    return div_total, price_yoy_total
+
+
+BACKTEST_HORIZONS = [5, 10, 20]  # 事後驗證用的天數（皆為交易日）
+# detect_patterns()裡14種型態的id/name對照（回後買上漲是獨立算的pb_all_pass，
+# 不在這14種裡——外面常講的「15種進場型態」是這14種圖形型態+回後買上漲）。
+PATTERN_DEFS = [
+    {"id": "hs", "name": "頭肩底"}, {"id": "chs", "name": "複式頭肩底"}, {"id": "nb", "name": "N字底"},
+    {"id": "tb", "name": "三重底"}, {"id": "rb", "name": "圓弧底"}, {"id": "fb", "name": "一字底(均線糾結)"},
+    {"id": "abc", "name": "突破ABC修正下降切線"}, {"id": "channel", "name": "突破上升軌道線"},
+    {"id": "blackk", "name": "突破飆股大量黑K最高點"}, {"id": "kbp", "name": "K線橫盤的突破"},
+    {"id": "harami_bear", "name": "母子懷抱(高檔)"}, {"id": "harami_bull", "name": "母子懷抱(低檔)"},
+    {"id": "morning_star", "name": "晨星"}, {"id": "evening_star", "name": "夜星"},
+]
+
+
+def init_backtest_table():
+    conn = sqlite3.connect(SNAPSHOT_DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_evals (
+            eval_date TEXT NOT NULL,
+            stock_id TEXT NOT NULL,
+            name TEXT,
+            score INTEGER,
+            plus_di REAL,
+            minus_di REAL,
+            adx REAL,
+            adxr REAL,
+            bb_pos REAL,
+            is_breakout INTEGER,
+            is_pullback_rebound INTEGER,
+            entry_close REAL,
+            ret_5d REAL,
+            ret_10d REAL,
+            ret_20d REAL,
+            created_at TEXT,
+            PRIMARY KEY (eval_date, stock_id)
+        )
+    """)
+    # 相容舊資料庫：用 ALTER TABLE 補新欄位，已存在就吃掉錯誤跳過
+    # （SQLite沒有 ADD COLUMN IF NOT EXISTS，只能用這種方式相容舊表）
+    for col_def in [
+        "pattern_formed INTEGER",
+        "pattern_breakout INTEGER",
+        "pattern_just_broke INTEGER",
+        "pb_all_pass INTEGER",
+        "div_total REAL",
+        "price_yoy_1q REAL",
+        "golden_cross_recent INTEGER",
+        "kdj_golden_cross_recent INTEGER",
+        "kdj_death_cross_recent INTEGER",
+        "pattern_hits_json TEXT",
+        "rel_strength_20 REAL",
+        "vol_ratio REAL",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE backtest_evals ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass  # 欄位已存在
+    conn.commit()
+    return conn
+
+
+def run_historical_backtest(token: str, months_back: int = 3, include_pattern: bool = True,
+                             include_div: bool = False,
+                             min_liquidity: float = 0):
+    """回溯過去 months_back 個月，對每個交易日重新計算「當時」的DMI/評分/訊號
+    （只用當天以前的資料切片再丟進既有的 calc_dmi／score_dmi／compute_core_signals／
+    check_pullback_buy／detect_patterns，保證沒有偷看未來——這幾個函式本來就是
+    「給一段資料、算出最後一天的訊號」，直接重複利用，不用另外寫一套向量化版本
+    冒index算錯的風險），然後對照5/10/20天後的實際收盤價算出報酬率，存進
+    backtest_evals 表。
+
+    型態確認（型態辨識、回後買上漲）不需要額外API，直接免費算；近1季YoY乖離度
+    需要多抓一組歷史資料（季度營收），而且要算YoY需要抓到超過一年的股價歷史，
+    勾選這項時，每檔股票的抓取天數／API呼叫次數都會明顯增加，整體時間可能拉長
+    到原本的1.5-2倍。美股沒有三大法人買賣超這種資料，這裡跟台股版不同，沒有
+    對應的選項。
+
+    美股是季報，公告有『時間差』（用季末+45天估計，非精確申報日），這裡用
+    revenue_known_by_us 嚴格只採用『評估當天已經公告』的季度，避免回測偷看
+    『當下還沒公告』的營收資料。
+
+    每檔股票固定用S&P500清單當樣本池。運算量本身很小（純迴圈，沒有額外API呼叫），
+    真正花時間的還是500多檔的資料抓取次數。
+    """
+    conn = init_backtest_table()
+    name_map = SP500_NAMES
+    lookback_buffer = 60
+    max_horizon = max(BACKTEST_HORIZONS)
+    # 乖離度需要YoY比較（去年同季），所以價格歷史要抓到超過12個月，才能覆蓋
+    # 整個評估窗內每一天回頭看「去年同季」的均價
+    price_fetch_days = (months_back * 30 + lookback_buffer + max_horizon + 10 + 400) if include_div \
+        else (months_back * 30 + lookback_buffer + max_horizon + 10)
+    quarters_back = -(-months_back // 3) + 5  # 涵蓋YoY所需的前一年同期，math.ceil的整數版寫法
+
+    # 相對強弱要用的大盤(SPY)資料，整個回測只抓一次，不是每檔股票各抓一次
+    try:
+        benchmark = fetch_benchmark_series(token, price_fetch_days)
+    except Exception:
+        benchmark = None  # 抓不到大盤資料，相對強弱那組欄位/旗標就不會出現，不影響其他分析
+
+    total = len(SP500_LIST)
+    progress_bar = st.progress(0)
+    status = st.empty()
+    log_box = st.expander("🔬 回測進度紀錄（展開查看逐檔進度）", expanded=False)
+    saved_rows, failed = 0, 0
+
+    for i, sid in enumerate(SP500_LIST):
+        status.text(f"🔬 回測中：{sid}… ({i + 1}/{total})　已存 {saved_rows:,} 筆　失敗 {failed} 檔")
+        try:
+            rows = fetch_price_data(sid, token, price_fetch_days)
+            raw_data = sorted(
+                [{"date": d["date"], "open": float(d["open"]), "high": float(d["high"]),
+                  "low": float(d["low"]), "close": float(d["close"]), "volume": float(d.get("volume") or 0)}
+                 for d in rows],
+                key=lambda x: x["date"],
+            )
+            data = enrich(raw_data)
+            n = len(data)
+            eval_start = lookback_buffer
+            eval_end = n - max_horizon  # 不含此index，確保每個評估點後面都還有滿20天可以驗證
+            if eval_end <= eval_start:
+                failed += 1
+                continue
+
+            rev_map, price_month_avg_map = {}, {}
+            if include_div:
+                try:
+                    rev_map = fetch_revenue_history_for_backtest_us(sid, token, quarters_back)
+                    price_month_avg_map = build_price_quarter_avg_map_us(data)
+                except Exception:
+                    rev_map = {}  # 抓不到就這個標的的乖離度全部是None，不影響其他欄位
+
+            name = name_map.get(sid, sid)
+            # 限定只評估「最近 months_back 個月」範圍內的交易日。用「這次實際抓到
+            # 的資料裡最新一天」當基準往回推，不要用「今天」當基準——FMP有時候
+            # 回傳的資料不是精準到今天（例如資料本身有落後），用「今天」當基準
+            # 會導致整批資料被誤判成太舊而濾空。
+            latest_data_date = data[-1]["date"]
+            eval_window_start_date = (
+                datetime.strptime(latest_data_date, "%Y-%m-%d") - timedelta(days=months_back * 30)
+            ).strftime("%Y-%m-%d")
+
+            for idx in range(eval_start, eval_end):
+                eval_date = data[idx]["date"]
+                if eval_date < eval_window_start_date:
+                    continue
+                if min_liquidity > 0:
+                    liq_start = max(0, idx - 19)
+                    liq_bars = data[liq_start:idx + 1]
+                    avg_liquidity = sum(b["close"] * b["volume"] for b in liq_bars) / len(liq_bars)
+                    if avg_liquidity < min_liquidity:
+                        continue  # 當時的流動性不夠，跳過這個評估點
+                data_slice = data[:idx + 1]  # 只給「當時」以前的資料，不含未來
+                dmi = calc_dmi(data_slice, 14)
+                dm = score_dmi(dmi)
+                sig = compute_core_signals(data_slice, dm)
+                rel_strength_20 = compute_relative_strength(data_slice, benchmark, 20) if benchmark else None
+                vol_ratio = compute_vol_ratio(data_slice)
+
+                pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass = None, None, None, None
+                pattern_hits_json = None
+                if include_pattern:
+                    pb = check_pullback_buy(data_slice)
+                    pt = detect_patterns(data_slice, pb)
+                    pattern_formed = int(pt["anyFormed"])
+                    pattern_breakout = int(pt["anyBreakout"])
+                    pattern_just_broke = int(pt["anyJustBroke"])
+                    pb_all_pass = int(pb["allPass"])
+                    # 15種型態各自的「剛形成」（justBroke）：跟aggregate的anyJustBroke
+                    # 同一套判斷邏輯，只是拆成每個型態各自記錄。存成JSON字串（SQLite
+                    # 沒有原生的dict欄位），要用時再解回來。
+                    pattern_hits = {pr["id"]: (1 if pr["justBroke"] else 0) for pr in pt["results"]}
+                    pattern_hits_json = json.dumps(pattern_hits)
+
+                div_total, price_yoy_1q = compute_divergence_asof_us(rev_map, price_month_avg_map, eval_date) if include_div else (None, None)
+
+                entry_close = data[idx]["close"]
+                rets = {}
+                for h in BACKTEST_HORIZONS:
+                    if idx + h < n and entry_close:
+                        rets[h] = (data[idx + h]["close"] - entry_close) / entry_close * 100
+                    else:
+                        rets[h] = None
+                conn.execute("""
+                    INSERT OR REPLACE INTO backtest_evals
+                    (eval_date, stock_id, name, score, plus_di, minus_di, adx, adxr, bb_pos,
+                     is_breakout, is_pullback_rebound, entry_close, ret_5d, ret_10d, ret_20d,
+                     pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
+                     div_total, price_yoy_1q, golden_cross_recent,
+                     kdj_golden_cross_recent, kdj_death_cross_recent, pattern_hits_json,
+                     rel_strength_20, vol_ratio, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    eval_date, sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
+                    sig["bb_pos"], int(sig["is_breakout"]), int(sig["is_pullback_rebound"]), entry_close,
+                    rets[5], rets[10], rets[20],
+                    pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
+                    div_total, price_yoy_1q, int(sig["golden_cross_recent"]),
+                    int(sig["kdj_golden_cross_recent"]), int(sig["kdj_death_cross_recent"]), pattern_hits_json,
+                    rel_strength_20, vol_ratio,
+                    datetime.now().isoformat(timespec="seconds"),
+                ))
+                saved_rows += 1
+            if (i + 1) % 20 == 0:
+                conn.commit()
+        except Exception as ex:
+            failed += 1
+            with log_box:
+                st.caption(f"❌ {sid} 失敗：{ex}")
+        progress_bar.progress((i + 1) / total)
+        if i < total - 1:
+            time.sleep(0.3)
+
+    conn.commit()
+    conn.close()
+    progress_bar.empty()
+    status.empty()
+    st.success(f"✅ 歷史回測完成：{saved_rows:,} 筆評估紀錄（{total - failed}/{total} 檔成功），可以往下看分析結果")
+
+
+def load_backtest_df():
+    if not os.path.exists(SNAPSHOT_DB_PATH):
+        return None
+    conn = sqlite3.connect(SNAPSHOT_DB_PATH)
+    try:
+        df = pd.read_sql_query("SELECT * FROM backtest_evals", conn)
+    except Exception:
+        df = None
+    conn.close()
+    if df is None or df.empty:
+        return None
+    if "pattern_hits_json" in df.columns:
+        df["pattern_hits"] = df["pattern_hits_json"].apply(
+            lambda s: json.loads(s) if isinstance(s, str) else None
+        )
+    return df
+
+
+def analyze_score_buckets(df: pd.DataFrame) -> pd.DataFrame:
+    def bucket(s):
+        if s >= 80:
+            return "80-100（積極做多）"
+        if s >= 65:
+            return "65-79（可考慮進場）"
+        if s >= 50:
+            return "50-64（觀望）"
+        return "0-49（不建議）"
+
+    d = df.copy()
+    d["bucket"] = d["score"].apply(bucket)
+    order = ["0-49（不建議）", "50-64（觀望）", "65-79（可考慮進場）", "80-100（積極做多）"]
+    rows = []
+    for b, g in d.groupby("bucket"):
+        row = {"評分區間": b, "樣本數": len(g)}
+        for h in BACKTEST_HORIZONS:
+            valid = g[f"ret_{h}d"].dropna()
+            row[f"{h}日平均報酬%"] = round(valid.mean(), 2) if len(valid) else None
+            row[f"{h}日勝率%"] = round((valid > 0).mean() * 100, 1) if len(valid) else None
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    result["_order"] = result["評分區間"].apply(lambda x: order.index(x) if x in order else 99)
+    return result.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
+
+def analyze_tag_hitrate(df: pd.DataFrame, tag_col: str, tag_label: str) -> pd.DataFrame:
+    rows = []
+    for val, g in df.groupby(tag_col):
+        label = f"{tag_label}＝是" if val == 1 else f"{tag_label}＝否"
+        row = {"標記": label, "樣本數": len(g)}
+        for h in BACKTEST_HORIZONS:
+            valid = g[f"ret_{h}d"].dropna()
+            row[f"{h}日平均報酬%"] = round(valid.mean(), 2) if len(valid) else None
+            row[f"{h}日勝率%"] = round((valid > 0).mean() * 100, 1) if len(valid) else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def analyze_pattern_hits(df: pd.DataFrame) -> pd.DataFrame:
+    """15種型態各自「剛形成」單獨列一列（只看「是」的情況，橫向比較15種型態彼此
+    的表現，不是看單一型態內部有沒有效）。依樣本數由多到少排序，樣本數<10筆的
+    型態不列出，避免單一兩筆資料的100%勝率造成誤導。"""
+    if "pattern_hits" not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for pdef in PATTERN_DEFS:
+        pid = pdef["id"]
+        mask = df["pattern_hits"].apply(lambda h: bool(h) and h.get(pid) == 1)
+        g = df[mask]
+        if len(g) < 10:
+            continue
+        row = {"型態": pdef["name"] + "剛形成", "樣本數": len(g)}
+        for h in BACKTEST_HORIZONS:
+            valid = g[f"ret_{h}d"].dropna()
+            row[f"{h}日平均報酬%"] = round(valid.mean(), 2) if len(valid) else None
+            row[f"{h}日勝率%"] = round((valid > 0).mean() * 100, 1) if len(valid) else None
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("樣本數", ascending=False).reset_index(drop=True)
+    return result
+
+
+def grid_search_params(df: pd.DataFrame, target_horizon: int = 10):
+    """在已收集的原始指標值（+DI/-DI/ADX/ADXR）上，重新代入不同的評分公式參數
+    （方向性權重、ADX滿分上限、ADXR加分值）試算，看哪組參數對N天後報酬的判斷力
+    比較好——不需要重新抓資料，純粹是在同一份歷史資料上換公式重算。
+    這是簡化版網格搜尋，樣本數有限時容易過度適配歷史資料，結果僅供參考方向，
+    不建議未經檢視就直接套用到正式評分公式。"""
+    ret_col = f"ret_{target_horizon}d"
+    valid_df = df.dropna(subset=[ret_col, "plus_di", "minus_di", "adx"]).copy()
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    di_sum = valid_df["plus_di"] + valid_df["minus_di"]
+    di_dom = np.where(di_sum > 0, valid_df["plus_di"] / di_sum * 100, 50)
+    has_adxr = valid_df["adxr"].notna()
+    adx_gt_adxr = valid_df["adx"] > valid_df["adxr"].fillna(-1)
+
+    results = []
+    for adx_cap in [30, 40, 50]:
+        for adxr_bonus in [15, 20, 25]:
+            for di_weight in [0.4, 0.5, 0.6]:
+                di_pts = di_dom * di_weight
+                adx_max_pts = max(0, 100 - 100 * di_weight - adxr_bonus)  # 剩餘配分給ADX，確保三項頂多加到100
+                adx_pts = np.minimum(valid_df["adx"], adx_cap) / adx_cap * adx_max_pts
+                adxr_pts = np.where(has_adxr & adx_gt_adxr, adxr_bonus, 0)
+                new_score = np.clip(di_pts + adx_pts + adxr_pts, 0, 100)
+
+                for buy_thr in [50, 65, 80]:
+                    buy_mask = new_score >= buy_thr
+                    if buy_mask.sum() < 20:
+                        continue
+                    rets = valid_df.loc[buy_mask, ret_col]
+                    results.append({
+                        "方向性權重": di_weight, "ADX滿分上限": adx_cap, "ADXR加分": adxr_bonus,
+                        "買進門檻": buy_thr, "訊號數": int(buy_mask.sum()),
+                        f"{target_horizon}日平均報酬%": round(rets.mean(), 2),
+                        f"{target_horizon}日勝率%": round((rets > 0).mean() * 100, 1),
+                    })
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df
+    return result_df.sort_values(f"{target_horizon}日平均報酬%", ascending=False).head(15).reset_index(drop=True)
+
+
+# ────────────────────────────────────────────────────────────────
+# 多因子複選搜尋：把每一列資料轉成一組「條件旗標」（分數夠高、有突破盤標記、
+# 型態確認、布林通道位置、乖離度、法人買賣超…），然後窮舉1~3個條件的所有組合，
+# 看哪個組合的勝率/平均報酬最好。
+# ────────────────────────────────────────────────────────────────
+def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """把原始欄位轉成一組True/False條件旗標，供複選搜尋窮舉組合用。哪些旗標會
+    出現取決於這次回測有沒有收集對應欄位（乖離度／法人買賣超是可選的，型態確認
+    理論上一定有，但相容舊資料庫可能是空值，一併防呆）。"""
+    d = df.copy()
+    flags = {}
+    flags["多方力道≥65"] = d["score"] >= 65
+    flags["多方力道≥80"] = d["score"] >= 80
+    flags["強勢突破盤"] = d["is_breakout"] == 1
+    flags["跌深反彈盤"] = d["is_pullback_rebound"] == 1
+    flags["布林通道低檔(≤20%)"] = d["bb_pos"] <= 20
+    flags["布林通道高檔(≥80%)"] = d["bb_pos"] >= 80
+    if "golden_cross_recent" in d.columns and d["golden_cross_recent"].notna().any():
+        flags["MACD近3日內黃金交叉"] = d["golden_cross_recent"] == 1
+    if "kdj_golden_cross_recent" in d.columns and d["kdj_golden_cross_recent"].notna().any():
+        flags["KDJ近3日內黃金交叉"] = d["kdj_golden_cross_recent"] == 1
+    if "kdj_death_cross_recent" in d.columns and d["kdj_death_cross_recent"].notna().any():
+        flags["KDJ近3日內死亡交叉"] = d["kdj_death_cross_recent"] == 1
+    if "rel_strength_20" in d.columns and d["rel_strength_20"].notna().any():
+        flags["相對強弱為正(強於大盤)"] = d["rel_strength_20"] > 0
+        flags["相對強弱為負(弱於大盤)"] = d["rel_strength_20"] < 0
+    if "vol_ratio" in d.columns and d["vol_ratio"].notna().any():
+        flags["爆量(≥1.5倍均量)"] = d["vol_ratio"] >= 1.5
+        flags["爆量(≥2倍均量)"] = d["vol_ratio"] >= 2
+
+    if "pattern_formed" in d.columns and d["pattern_formed"].notna().any():
+        flags["型態成形中"] = d["pattern_formed"] == 1
+    if "pattern_breakout" in d.columns and d["pattern_breakout"].notna().any():
+        flags["型態突破確認"] = d["pattern_breakout"] == 1
+    if "pattern_just_broke" in d.columns and d["pattern_just_broke"].notna().any():
+        flags["型態剛形成(剛突破)"] = d["pattern_just_broke"] == 1
+    if "pb_all_pass" in d.columns and d["pb_all_pass"].notna().any():
+        flags["回後買上漲全通過"] = d["pb_all_pass"] == 1
+    if "div_total" in d.columns and d["div_total"].notna().any():
+        flags["近1季乖離度為正(營收優於股價)"] = d["div_total"] > 0
+        flags["近1季乖離度為負(股價超前營收)"] = d["div_total"] < 0
+    if "price_yoy_1q" in d.columns and d["price_yoy_1q"].notna().any():
+        flags["近1季均價YoY為正"] = d["price_yoy_1q"] > 0
+        flags["近1季均價YoY為負"] = d["price_yoy_1q"] < 0
+
+    # 15種進場型態裡的14種圖形型態，各自的「剛形成」單獨當一個條件旗標
+    # （回後買上漲已經是獨立的「回後買上漲全通過」旗標，這裡不重複）。
+    if "pattern_hits" in d.columns and d["pattern_hits"].notna().any():
+        for pdef in PATTERN_DEFS:
+            pid = pdef["id"]
+            flags[pdef["name"] + "剛形成"] = d["pattern_hits"].apply(
+                lambda h: bool(h) and h.get(pid) == 1
+            )
+
+    flag_df = pd.DataFrame(flags, index=d.index)
+    return pd.concat([d, flag_df], axis=1), list(flags.keys())
+
+
+def combo_search(df: pd.DataFrame, target_horizon: int = 10, max_combo_size: int = 3,
+                  min_samples: int = 50, top_n: int = 20):
+    """窮舉1~max_combo_size個條件旗標的AND組合，看哪個組合對N天後報酬的判斷力
+    最好。組合數會隨旗標數量跟max_combo_size快速增加（這是多重比較，測試的組合
+    越多，純粹運氣好而表現突出的組合也會越多，不是每個排前面的組合都代表真的
+    有效——樣本數門檻（min_samples）是用來過濾掉「條件太嚴苛、樣本太少」的組合，
+    但無法完全排除多重比較造成的偽陽性，結果僅供參考方向）。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col])
+    if valid.empty or not flag_names:
+        return pd.DataFrame(), 0
+
+    results = []
+    combos_tested = 0
+    for size in range(1, max_combo_size + 1):
+        for combo in itertools.combinations(flag_names, size):
+            mask = valid[list(combo)].all(axis=1)
+            combos_tested += 1
+            n_match = int(mask.sum())
+            if n_match < min_samples:
+                continue
+            rets = valid.loc[mask, ret_col]
+            results.append({
+                "條件組合": " ＋ ".join(combo),
+                "條件數": size,
+                "樣本數": n_match,
+                f"{target_horizon}日平均報酬%": round(rets.mean(), 2),
+                f"{target_horizon}日勝率%": round((rets > 0).mean() * 100, 1),
+            })
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df, combos_tested
+    result_df = result_df.sort_values(f"{target_horizon}日勝率%", ascending=False).head(top_n).reset_index(drop=True)
+    return result_df, combos_tested
+
+
+def find_moonshot_combos(df: pd.DataFrame, target_horizon: int = 10, threshold: float = 30,
+                          max_combo_size: int = 3, min_samples: int = 20, top_n: int = 20):
+    """飆股搜尋：找哪些條件組合最容易在N天內出現「漲幅超過threshold%」的大行情，
+    跟combo_search看的東西不一樣——那邊看的是『平均表現/整體勝率』，這裡只看
+    『命中大行情的比例』，一個組合平均報酬普通、但只要常常出現飆股也會被排到
+    前面。從沒出現過飆股的組合直接不列出來（沒意義）。飆股本來就是稀有事件，
+    樣本數門檻預設調低到20，但仍要搭配『飆股次數』一起看，次數只有個位數的
+    不建議當真——比例再高，靠幾次極端值撐出來的數字沒有統計意義。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col])
+    if valid.empty or not flag_names:
+        return pd.DataFrame(), 0
+
+    results = []
+    combos_tested = 0
+    for size in range(1, max_combo_size + 1):
+        for combo in itertools.combinations(flag_names, size):
+            mask = valid[list(combo)].all(axis=1)
+            combos_tested += 1
+            n_match = int(mask.sum())
+            if n_match < min_samples:
+                continue
+            rets = valid.loc[mask, ret_col]
+            moonshots = rets[rets > threshold]
+            if moonshots.empty:
+                continue
+            results.append({
+                "條件組合": " ＋ ".join(combo),
+                "條件數": size,
+                "樣本數": n_match,
+                "飆股次數": len(moonshots),
+                "飆股比例%": round(len(moonshots) / n_match * 100, 1),
+                "飆股平均漲幅%": round(moonshots.mean(), 1),
+            })
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df, combos_tested
+    result_df = result_df.sort_values("飆股比例%", ascending=False).head(top_n).reset_index(drop=True)
+    return result_df, combos_tested
+
+
+# 使用者指定要追蹤的特定條件組合——跟上面窮舉搜尋不一樣的地方是：這些組合不管
+# 樣本數多少、排名有沒有進前幾名，都一定會顯示出來，方便針對特定假設做比較
+# （例如「型態突破確認+均價YoY轉正」這種有明確邏輯的假設，即使沒有進入排行榜，
+# 使用者可能還是想知道它實際表現如何）。
+# ✅ 2026-09-21 美股（S&P500）自己的歷史回測結果，這份是真正驗證過的資料。
+# 22組去重後的高勝率組合（同一組合出現在多個天數的榜單就合併成一列，
+# PINNED_COMBO_WINRATES記錄各天數的勝率）。
+PINNED_COMBOS = [
+    ["KDJ近3日內死亡交叉", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    ["布林通道低檔(≤20%)", "KDJ近3日內黃金交叉", "母子懷抱(高檔)剛形成"],
+    ["KDJ近3日內黃金交叉", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    ["N字底剛形成", "三重底剛形成", "一字底(均線糾結)剛形成"],
+    ["布林通道低檔(≤20%)", "母子懷抱(高檔)剛形成"],
+    ["多方力道≥65", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    ["強勢突破盤", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    ["布林通道高檔(≥80%)", "頭肩底剛形成", "圓弧底剛形成"],
+    ["頭肩底剛形成", "圓弧底剛形成"],
+    ["布林通道低檔(≤20%)", "夜星剛形成"],
+    ["回後買上漲全通過", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    ["頭肩底剛形成", "N字底剛形成", "圓弧底剛形成"],
+    ["強勢突破盤", "頭肩底剛形成", "圓弧底剛形成"],
+    ["多方力道≥80", "布林通道高檔(≥80%)", "母子懷抱(高檔)剛形成"],
+    ["KDJ近3日內黃金交叉", "複式頭肩底剛形成", "圓弧底剛形成"],
+    ["夜星剛形成"],
+    ["多方力道≥80", "MACD近3日內黃金交叉", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "強勢突破盤", "一字底(均線糾結)剛形成"],
+    ["KDJ近3日內死亡交叉", "N字底剛形成", "K線橫盤的突破剛形成"],
+    ["多方力道≥80", "一字底(均線糾結)剛形成"],
+    ["多方力道≥65", "圓弧底剛形成", "一字底(均線糾結)剛形成"],
+    ["強勢突破盤", "圓弧底剛形成", "突破飆股大量黑K最高點剛形成"],
+]
+
+PINNED_COMBO_WINRATES = {
+    "KDJ近3日內死亡交叉 ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {10: 80.4},
+    "布林通道低檔(≤20%) ＋ KDJ近3日內黃金交叉 ＋ 母子懷抱(高檔)剛形成": {10: 76.9, 20: 75.4},
+    "KDJ近3日內黃金交叉 ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {5: 66.7, 10: 74.4},
+    "N字底剛形成 ＋ 三重底剛形成 ＋ 一字底(均線糾結)剛形成": {5: 68.9, 10: 72.2},
+    "布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成": {10: 71.8, 20: 68.2},
+    "多方力道≥65 ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {10: 71.4},
+    "強勢突破盤 ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {5: 68.6, 10: 70.5},
+    "布林通道高檔(≥80%) ＋ 頭肩底剛形成 ＋ 圓弧底剛形成": {5: 73.1, 10: 70.5},
+    "頭肩底剛形成 ＋ 圓弧底剛形成": {5: 73.8, 10: 70.2, 20: 67.9},
+    "布林通道低檔(≤20%) ＋ 夜星剛形成": {5: 68.4, 10: 69.4},
+    "回後買上漲全通過 ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {5: 67.1, 10: 68.4},
+    "頭肩底剛形成 ＋ N字底剛形成 ＋ 圓弧底剛形成": {5: 72.0, 20: 68.0},
+    "強勢突破盤 ＋ 頭肩底剛形成 ＋ 圓弧底剛形成": {5: 70.7},
+    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ 母子懷抱(高檔)剛形成": {5: 68.5},
+    "KDJ近3日內黃金交叉 ＋ 複式頭肩底剛形成 ＋ 圓弧底剛形成": {5: 67.9},
+    "夜星剛形成": {5: 66.0},
+    "多方力道≥80 ＋ MACD近3日內黃金交叉 ＋ 突破ABC修正下降切線剛形成": {20: 74.1},
+    "多方力道≥80 ＋ 強勢突破盤 ＋ 一字底(均線糾結)剛形成": {20: 73.4},
+    "KDJ近3日內死亡交叉 ＋ N字底剛形成 ＋ K線橫盤的突破剛形成": {20: 73.0},
+    "多方力道≥80 ＋ 一字底(均線糾結)剛形成": {20: 72.7},
+    "多方力道≥65 ＋ 圓弧底剛形成 ＋ 一字底(均線糾結)剛形成": {20: 72.3},
+    "強勢突破盤 ＋ 圓弧底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {20: 68.4},
+}
+
+
+def format_winrates(wr_dict):
+    """把 {5:64.2, 10:67.4} 這種dict轉成 '5日64.2% / 10日67.4%' 的顯示字串"""
+    if not wr_dict:
+        return None
+    parts = [f"{h}日{wr_dict[h]}%" for h in (5, 10, 20) if h in wr_dict]
+    return " / ".join(parts) if parts else None
+
+
+# ✅ 同一次2026-09-21回測的飆股搜尋結果（10日/20日，漲幅門檻30%），23組去重後
+# 的高標股組合。這是「命中大行情的比例」，不是整體勝率，跟上面PINNED_COMBOS
+# 是不同分類，飆股比例高不代表整體勝率高。
+MOONSHOT_COMBOS = [
+    ["強勢突破盤", "回後買上漲全通過", "晨星剛形成"],
+    ["多方力道≥65", "強勢突破盤", "晨星剛形成"],
+    ["多方力道≥65", "回後買上漲全通過", "晨星剛形成"],
+    ["強勢突破盤", "晨星剛形成"],
+    ["布林通道高檔(≥80%)", "回後買上漲全通過", "晨星剛形成"],
+    ["回後買上漲全通過", "晨星剛形成"],
+    ["多方力道≥65", "布林通道高檔(≥80%)", "晨星剛形成"],
+    ["多方力道≥80", "KDJ近3日內死亡交叉", "夜星剛形成"],
+    ["多方力道≥80", "夜星剛形成"],
+    ["多方力道≥65", "KDJ近3日內黃金交叉", "夜星剛形成"],
+    ["多方力道≥65", "母子懷抱(高檔)剛形成", "夜星剛形成"],
+    ["多方力道≥80", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
+    ["布林通道高檔(≥80%)", "KDJ近3日內死亡交叉", "夜星剛形成"],
+    ["多方力道≥65", "布林通道高檔(≥80%)", "夜星剛形成"],
+    ["多方力道≥65", "KDJ近3日內死亡交叉", "夜星剛形成"],
+    ["回後買上漲全通過", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
+    ["布林通道高檔(≥80%)", "夜星剛形成"],
+    ["KDJ近3日內死亡交叉", "母子懷抱(高檔)剛形成", "夜星剛形成"],
+    ["KDJ近3日內黃金交叉", "母子懷抱(高檔)剛形成", "夜星剛形成"],
+    ["母子懷抱(高檔)剛形成", "夜星剛形成"],
+    ["MACD近3日內黃金交叉", "KDJ近3日內死亡交叉", "母子懷抱(高檔)剛形成"],
+    ["突破飆股大量黑K最高點剛形成", "晨星剛形成"],
+    ["布林通道低檔(≤20%)", "母子懷抱(高檔)剛形成", "夜星剛形成"],
+]
+
+MOONSHOT_COMBO_STATS = {
+    "強勢突破盤 ＋ 回後買上漲全通過 ＋ 晨星剛形成": {10: {"n": 20, "moonshot_n": 3, "pct": 15.0, "avg": 35.6}},
+    "多方力道≥65 ＋ 強勢突破盤 ＋ 晨星剛形成": {10: {"n": 28, "moonshot_n": 3, "pct": 10.7, "avg": 35.6}},
+    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 晨星剛形成": {10: {"n": 30, "moonshot_n": 3, "pct": 10.0, "avg": 35.6}},
+    "強勢突破盤 ＋ 晨星剛形成": {10: {"n": 47, "moonshot_n": 3, "pct": 6.4, "avg": 35.6}},
+    "布林通道高檔(≥80%) ＋ 回後買上漲全通過 ＋ 晨星剛形成": {10: {"n": 48, "moonshot_n": 3, "pct": 6.3, "avg": 35.6}},
+    "回後買上漲全通過 ＋ 晨星剛形成": {10: {"n": 56, "moonshot_n": 3, "pct": 5.4, "avg": 35.6}},
+    "多方力道≥65 ＋ 布林通道高檔(≥80%) ＋ 晨星剛形成": {10: {"n": 63, "moonshot_n": 3, "pct": 4.8, "avg": 35.6}},
+    "多方力道≥80 ＋ KDJ近3日內死亡交叉 ＋ 夜星剛形成": {10: {"n": 27, "moonshot_n": 2, "pct": 7.4, "avg": 37.7}, 20: {"n": 27, "moonshot_n": 5, "pct": 18.5, "avg": 46.4}},
+    "多方力道≥80 ＋ 夜星剛形成": {10: {"n": 33, "moonshot_n": 2, "pct": 6.1, "avg": 37.7}, 20: {"n": 33, "moonshot_n": 5, "pct": 15.2, "avg": 46.4}},
+    "多方力道≥65 ＋ KDJ近3日內黃金交叉 ＋ 夜星剛形成": {10: {"n": 23, "moonshot_n": 1, "pct": 4.3, "avg": 34.3}, 20: {"n": 23, "moonshot_n": 3, "pct": 13.0, "avg": 44.0}},
+    "多方力道≥65 ＋ 母子懷抱(高檔)剛形成 ＋ 夜星剛形成": {10: {"n": 24, "moonshot_n": 1, "pct": 4.2, "avg": 41.1}},
+    "多方力道≥80 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {10: {"n": 25, "moonshot_n": 1, "pct": 4.0, "avg": 30.5}},
+    "布林通道高檔(≥80%) ＋ KDJ近3日內死亡交叉 ＋ 夜星剛形成": {10: {"n": 25, "moonshot_n": 1, "pct": 4.0, "avg": 41.1}, 20: {"n": 25, "moonshot_n": 4, "pct": 16.0, "avg": 44.4}},
+    "多方力道≥65 ＋ 布林通道高檔(≥80%) ＋ 夜星剛形成": {10: {"n": 26, "moonshot_n": 1, "pct": 3.8, "avg": 41.1}},
+    "多方力道≥65 ＋ KDJ近3日內死亡交叉 ＋ 夜星剛形成": {10: {"n": 59, "moonshot_n": 2, "pct": 3.4, "avg": 37.7}, 20: {"n": 59, "moonshot_n": 8, "pct": 13.6, "avg": 47.1}},
+    "回後買上漲全通過 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {10: {"n": 33, "moonshot_n": 1, "pct": 3.0, "avg": 30.5}},
+    "布林通道高檔(≥80%) ＋ 夜星剛形成": {10: {"n": 34, "moonshot_n": 1, "pct": 2.9, "avg": 41.1}},
+    "KDJ近3日內死亡交叉 ＋ 母子懷抱(高檔)剛形成 ＋ 夜星剛形成": {20: {"n": 45, "moonshot_n": 7, "pct": 15.6, "avg": 51.4}},
+    "KDJ近3日內黃金交叉 ＋ 母子懷抱(高檔)剛形成 ＋ 夜星剛形成": {20: {"n": 20, "moonshot_n": 3, "pct": 15.0, "avg": 32.0}},
+    "母子懷抱(高檔)剛形成 ＋ 夜星剛形成": {20: {"n": 78, "moonshot_n": 11, "pct": 14.1, "avg": 52.2}},
+    "MACD近3日內黃金交叉 ＋ KDJ近3日內死亡交叉 ＋ 母子懷抱(高檔)剛形成": {20: {"n": 29, "moonshot_n": 4, "pct": 13.8, "avg": 44.9}},
+    "突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {20: {"n": 23, "moonshot_n": 3, "pct": 13.0, "avg": 40.8}},
+    "布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成 ＋ 夜星剛形成": {20: {"n": 23, "moonshot_n": 3, "pct": 13.0, "avg": 64.7}},
+}
+
+
+def format_moonshot_entry(e):
+    """把 {"n":28,"moonshot_n":4,"pct":14.3,"avg":42.3} 轉成 '28筆中4次飆股(14.3%)，平均漲幅+42.3%'"""
+    return f'{e["n"]}筆中{e["moonshot_n"]}次飆股({e["pct"]}%)，平均漲幅+{e["avg"]}%'
+
+
+def format_moonshot_stats(stats_dict):
+    if not stats_dict:
+        return None
+    parts = [f"{h}日：{format_moonshot_entry(stats_dict[h])}" for h in (10, 20) if h in stats_dict]
+    return "　｜　".join(parts) if parts else None
+
+
+def moonshot_combo_static_stats(combos, stats_map) -> pd.DataFrame:
+    """把MOONSHOT_COMBOS固定的23組轉成表格——直接用「2026-09-21美股飆股搜尋」
+    記錄下來的靜態資料，不隨目前bt_df重算（跟pinned_combo_stats不同，那個是每次
+    都用目前資料現算）。美股這次飆股搜尋只跑了10日/20日，沒有5日資料。"""
+    rows = []
+    for combo in combos:
+        key = " ＋ ".join(combo)
+        stats = stats_map.get(key, {})
+        row = {"條件組合": key, "條件數": len(combo)}
+        for h in (10, 20):
+            e = stats.get(h)
+            row[f"{h}日樣本數"] = e["n"] if e else None
+            row[f"{h}日飆股次數"] = e["moonshot_n"] if e else None
+            row[f"{h}日飆股比例%"] = e["pct"] if e else None
+            row[f"{h}日飆股平均漲幅%"] = f'+{e["avg"]}' if e else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def pinned_combo_stats(df: pd.DataFrame, combos, target_horizon: int = 10) -> pd.DataFrame:
+    """算指定條件組合的表現，不受樣本數門檻或排名影響，全部顯示。缺欄位（例如
+    沒勾選對應的可選資料）或沒有符合樣本的組合，也會列出來並註明原因，而不是
+    悄悄跳過讓使用者以為系統忘了測。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col]) if ret_col in d.columns else d.iloc[0:0]
+
+    rows = []
+    for combo in combos:
+        is_kdj_morning_star = "KDJ近3日內黃金交叉" in combo and "晨星剛形成" in combo
+        label = ("⭐ " if is_kdj_morning_star else "") + " ＋ ".join(combo)
+        recorded_wr = format_winrates(PINNED_COMBO_WINRATES.get(" ＋ ".join(combo)))
+        missing = [c for c in combo if c not in flag_names]
+        if missing:
+            rows.append({"條件組合": label, "樣本數": 0, "歷史勝率(記錄)": recorded_wr,
+                         f"{target_horizon}日平均報酬%": None, f"{target_horizon}日勝率%": None,
+                         "備註": f"缺少欄位（可能沒勾選對應的可選資料）：{'、'.join(missing)}"})
+            continue
+        mask = valid[combo].all(axis=1)
+        n_match = int(mask.sum())
+        if n_match == 0:
+            rows.append({"條件組合": label, "樣本數": 0, "歷史勝率(記錄)": recorded_wr,
+                         f"{target_horizon}日平均報酬%": None, f"{target_horizon}日勝率%": None,
+                         "備註": "目前回測資料裡沒有符合這個組合的樣本"})
+            continue
+        rets = valid.loc[mask, ret_col]
+        rows.append({
+            "條件組合": label, "樣本數": n_match, "歷史勝率(記錄)": recorded_wr,
+            f"{target_horizon}日平均報酬%": round(rets.mean(), 2),
+            f"{target_horizon}日勝率%": round((rets > 0).mean() * 100, 1),
+            "備註": "" if n_match >= 50 else "⚠️樣本數偏少，僅供參考",
+        })
+    return pd.DataFrame(rows)
+
+
+# ────────────────────────────────────────────────────────────────
+# 回後買上漲 8 條件核對
+# ────────────────────────────────────────────────────────────────
+
+
+# ────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ────────────────────────────────────────────────────────────────
 
@@ -2459,6 +3390,29 @@ with st.sidebar:
 
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
 
+    with st.expander("🔬 歷史回測分析（事後驗證＋參數優化，美股／S&P500）"):
+        months_back_bt = st.number_input("回測天數（月）", min_value=1, max_value=36, value=3, step=1, key="bt_months_back_us")
+        st.caption(
+            "回溯過去N個月，用S&P500清單重新計算每個交易日『當時』的DMI/多方力道評分"
+            "（只用當天以前的資料，沒有偷看未來），對照5/10/20個交易日後的實際報酬，"
+            "驗證現有評分公式準不準，並試算不同參數組合的效果。月數愈大，跑的時間愈長，"
+            "拉到36個月時評估紀錄可能超過幾十萬筆，跑完可能要1小時以上，建議先從6-12"
+            "個月試跑，確認可行再拉長。過程中請勿切換分頁或關閉視窗。分析結果會顯示在"
+            "右側主畫面。"
+        )
+        st.caption("型態確認、回後買上漲不需要額外API，一律會記錄。以下這項要多抓一組資料，會拉長時間：")
+        include_div_bt = st.checkbox("📈 近1季YoY乖離度（需要超過1年的股價歷史，明顯拉長抓取時間）", value=False, key="bt_include_div_us")
+        st.caption("美股沒有三大法人買賣超這種資料，這裡跟台股版不同，沒有對應的選項。")
+        min_liquidity_wan_bt = st.number_input(
+            "最低近20日均成交金額（萬美元，0＝不篩選）", min_value=0, value=0, step=100, key="bt_min_liquidity_us"
+        )
+        st.caption(
+            "排除成交量太小的股票：每個評估點各自檢查『當時』往前20天的平均成交金額"
+            "（收盤價×成交量），低於門檻就跳過那個評估點——不是只看現在，避免用現在的"
+            "流動性去篩過去的資料。"
+        )
+        backtest_clicked_us = st.button("🔬 執行歷史回測", use_container_width=True, key="btn_backtest_us")
+
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
     if top100_clicked:
         st.session_state["_trigger_top100_gainers"] = True
@@ -2589,6 +3543,157 @@ def run_batch_analysis():
 
 if run_clicked or st.session_state.pop("_run_after_top100", False):
     run_batch_analysis()
+
+# ────────────────────────────────────────────────────────────────
+# 歷史回測分析結果（美股／S&P500）——觸發鈕在側邊欄，實際執行跟結果顯示都
+# 放在主畫面，表格才有足夠寬度顯示。
+# ────────────────────────────────────────────────────────────────
+if backtest_clicked_us:
+    if not api_token:
+        st.error("請輸入 Financial Modeling Prep API Key")
+    else:
+        run_historical_backtest(api_token, months_back=int(months_back_bt),
+                                 include_div=include_div_bt,
+                                 min_liquidity=float(min_liquidity_wan_bt) * 10000)
+
+bt_df_us = load_backtest_df()
+if bt_df_us is not None and not bt_df_us.empty:
+    st.divider()
+    st.markdown("## 🔬 歷史回測分析結果（美股／S&P500）")
+    st.markdown(
+        f"**目前累積 {len(bt_df_us):,} 筆評估紀錄**"
+        f"（{bt_df_us['eval_date'].min()} ～ {bt_df_us['eval_date'].max()}）"
+    )
+
+    st.markdown("##### 📊 評分區間 vs 實際報酬")
+    st.dataframe(analyze_score_buckets(bt_df_us), hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🚀 「強勢突破盤」標記 vs 實際報酬")
+    st.dataframe(analyze_tag_hitrate(bt_df_us, "is_breakout", "強勢突破盤"), hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
+    st.dataframe(analyze_tag_hitrate(bt_df_us, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
+
+    if "golden_cross_recent" in bt_df_us.columns and bt_df_us["golden_cross_recent"].notna().any():
+        st.markdown("##### ⚡ 「MACD近3日內黃金交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "golden_cross_recent", "MACD黃金交叉"), hide_index=True, use_container_width=True)
+
+    if "kdj_golden_cross_recent" in bt_df_us.columns and bt_df_us["kdj_golden_cross_recent"].notna().any():
+        st.markdown("##### 🟢 「KDJ近3日內黃金交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_golden_cross_recent", "KDJ黃金交叉"), hide_index=True, use_container_width=True)
+
+    if "kdj_death_cross_recent" in bt_df_us.columns and bt_df_us["kdj_death_cross_recent"].notna().any():
+        st.markdown("##### 🔴 「KDJ近3日內死亡交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_death_cross_recent", "KDJ死亡交叉"), hide_index=True, use_container_width=True)
+
+    if "rel_strength_20" in bt_df_us.columns and bt_df_us["rel_strength_20"].notna().any():
+        bt_df_us["rel_strength_positive"] = (bt_df_us["rel_strength_20"] > 0).astype("Int64")
+        bt_df_us.loc[bt_df_us["rel_strength_20"].isna(), "rel_strength_positive"] = pd.NA
+        st.markdown("##### 💪 「相對強弱(vs大盤SPY，20日)」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "rel_strength_positive", "相對強弱為正"), hide_index=True, use_container_width=True)
+
+    if "vol_ratio" in bt_df_us.columns and bt_df_us["vol_ratio"].notna().any():
+        bt_df_us["vol_surge_15"] = (bt_df_us["vol_ratio"] >= 1.5).astype("Int64")
+        bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_15"] = pd.NA
+        bt_df_us["vol_surge_2"] = (bt_df_us["vol_ratio"] >= 2).astype("Int64")
+        bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_2"] = pd.NA
+        st.markdown("##### 📊 「爆量(≥1.5倍均量)」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_15", "爆量1.5倍"), hide_index=True, use_container_width=True)
+        st.markdown("##### 📊 「爆量(≥2倍均量)」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_2", "爆量2倍"), hide_index=True, use_container_width=True)
+
+    if "pattern_breakout" in bt_df_us.columns and bt_df_us["pattern_breakout"].notna().any():
+        st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
+
+    if "pattern_just_broke" in bt_df_us.columns and bt_df_us["pattern_just_broke"].notna().any():
+        st.markdown("##### 🔥 「型態剛形成(剛突破)」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_just_broke", "型態剛形成"), hide_index=True, use_container_width=True)
+
+    if "pb_all_pass" in bt_df_us.columns and bt_df_us["pb_all_pass"].notna().any():
+        st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "pb_all_pass", "回後買上漲全通過"), hide_index=True, use_container_width=True)
+
+    pattern_hits_df_us = analyze_pattern_hits(bt_df_us)
+    if not pattern_hits_df_us.empty:
+        st.markdown("##### 📐 15種型態各自「剛形成」vs 實際報酬")
+        st.caption("依樣本數由多到少排序，樣本數<10筆的型態不列出（資料太少沒有參考意義）。這是每種型態單獨、不跟其他條件混在一起的乾淨表現。")
+        st.dataframe(pattern_hits_df_us, hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）")
+    st.caption(
+        "⚠️ 這是在已收集的歷史資料上找『表現較好』的參數組合，樣本數有限時容易"
+        "過度適配——建議當作方向參考，人工確認合理後再手動調整正式評分公式，"
+        "不要照單全收直接套用。"
+    )
+    horizon_choice_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="grid_horizon_us")
+    grid_df_us = grid_search_params(bt_df_us, target_horizon=horizon_choice_us)
+    if not grid_df_us.empty:
+        st.dataframe(grid_df_us, hide_index=True, use_container_width=True)
+    else:
+        st.caption("資料量還不夠做網格搜尋分析（需要至少20筆訊號才會列入單一組合）。")
+
+    st.markdown("##### 🧩 多因子複選搜尋（找出哪幾項欄位組合起來勝率最高）")
+    st.caption(
+        "窮舉1~3個條件旗標（分數門檻、強勢突破盤、跌深反彈盤、布林通道位置、"
+        "型態確認、乖離度…）的AND組合，看哪個組合的勝率/平均報酬最好。美股沒有"
+        "三大法人買賣超這種資料，旗標池跟台股版不同。⚠️ 測試的組合越多，純粹"
+        "運氣好而表現突出的組合也會越多（多重比較問題），下面會顯示總共測了"
+        "幾種組合——組合數越多，排在前面的結果就越需要保留懷疑，不代表真的"
+        "有效，建議搭配樣本數一起看，樣本數太小（例如剛好卡在門檻附近）的組合"
+        "更不可信。"
+    )
+    combo_horizon_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="combo_horizon_us")
+    combo_min_samples_us = st.number_input("最小樣本數門檻", min_value=10, max_value=1000, value=50, step=10, key="combo_min_samples_us")
+    combo_df_us, combos_tested_us = combo_search(bt_df_us, target_horizon=combo_horizon_us, min_samples=combo_min_samples_us)
+    st.caption(f"共測試了 {combos_tested_us:,} 種條件組合")
+    if not combo_df_us.empty:
+        st.dataframe(combo_df_us, hide_index=True, use_container_width=True)
+    else:
+        st.caption("目前沒有任何組合的樣本數達到門檻，試著調低最小樣本數，或先累積更多回測資料。")
+
+    st.markdown("##### 🎯 指定組合追蹤")
+    st.caption(
+        "22組（2026-09-21美股自己的回測結果，是真正驗證過的資料，不是移植台股"
+        "的假設清單），不受上面的樣本數門檻或排名影響，一律顯示（含備註說明"
+        "為什麼樣本數是0）。"
+    )
+    pinned_df_us = pinned_combo_stats(bt_df_us, PINNED_COMBOS, target_horizon=combo_horizon_us)
+    st.dataframe(pinned_df_us, hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🚀 飆股搜尋（找出最容易出現大行情的組合）")
+    st.caption(
+        "這裡看的不是『平均勝率』，是『這個組合出現後，有多高比例會在N天內飆漲"
+        "超過門檻%』——一個組合平均報酬普通，只要常常噴出大行情，一樣會排在前面。"
+        "⚠️ 飆股本來就是稀有事件，樣本數少時『飆股比例』很容易被少數幾次極端行情"
+        "撐出虛高的數字，務必搭配『飆股次數』一起看，次數只有個位數的不建議當真。"
+        "從沒出現過飆股的組合不會列出來。"
+    )
+    ms_col1_us, ms_col2_us = st.columns(2)
+    moonshot_horizon_us = ms_col1_us.selectbox("天數", BACKTEST_HORIZONS, index=1, key="moonshot_horizon_us")
+    moonshot_threshold_us = ms_col2_us.number_input("漲幅門檻(%)", min_value=5, max_value=200, value=30, step=5, key="moonshot_threshold_us")
+    moonshot_df_us, moonshot_combos_tested_us = find_moonshot_combos(
+        bt_df_us, target_horizon=moonshot_horizon_us, threshold=moonshot_threshold_us
+    )
+    st.caption(f"共測試了 {moonshot_combos_tested_us:,} 種條件組合，其中有飆股紀錄的列在下面：")
+    if not moonshot_df_us.empty:
+        st.dataframe(moonshot_df_us, hide_index=True, use_container_width=True)
+    else:
+        st.caption("目前沒有任何組合出現過符合門檻的飆股，可以試著調低漲幅門檻，或先累積更多回測資料。")
+
+    st.markdown(f"##### 🚀 高標股追蹤（指定{len(MOONSHOT_COMBOS)}組）")
+    st.caption(
+        "來源：2026-09-21美股飆股搜尋（10日/20日，漲幅門檻30%）的原始紀錄，固定"
+        "顯示這23組（不隨你目前的回測資料重算）。每組視當初出現在哪張榜單（10/20日），"
+        "列出樣本數、飆股次數、飆股比例%、飆股平均漲幅%。⚠️ 這是『命中大行情的比例』，"
+        "不是整體勝率——跟上面的『🎯指定組合追蹤』(高勝率) 是不同的分類，飆股比例高"
+        "不代表整體勝率高，兩者要分開看。多數組合樣本數只有20-80筆，飆股次數常常"
+        "只有個位數，數字僅供參考方向。"
+    )
+    st.dataframe(moonshot_combo_static_stats(MOONSHOT_COMBOS, MOONSHOT_COMBO_STATS),
+                 hide_index=True, use_container_width=True)
+
+
 if "batch_results" not in st.session_state:
     st.info("📈 請在左側輸入 Financial Modeling Prep API Key 與美股代號，點擊「批次分析」即可開始。")
 else:
