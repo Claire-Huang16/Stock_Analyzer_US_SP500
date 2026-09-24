@@ -16,6 +16,7 @@ import json
 import os
 import io
 import sqlite3
+import itertools
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -3148,6 +3149,89 @@ def moonshot_combo_static_stats(combos, stats_map) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def compute_live_flags_row(r):
+    """把批次分析結果的一列轉成「旗標列」，重複用同一套build_condition_flags判斷
+    邏輯，用來做即時掃描的指定組合命中。近1季乖離度/均價YoY只用最新一季（不是像
+    台股月營收那樣3個月加總）——跟回測的compute_divergence_asof_us用同一種
+    「近1季」語意，這樣即時掃描的旗標判斷才會跟回測驗證出來的組合定義一致。
+    美股沒有三大法人買賣超，沒有對應欄位。"""
+    dm = r["dm"]
+    sig = compute_core_signals(r["data"], dm)
+    rel_strength_20 = compute_relative_strength(r["data"], current_benchmark, 20) if current_benchmark else None
+    vol_ratio = compute_vol_ratio(r["data"])
+
+    rev = r.get("revRange")
+    px_range = r.get("priceYoYRange")
+    div_total, price_yoy_1q = None, None
+    if rev and px_range:
+        latest_rev = rev[-1]
+        if latest_rev.get("yoy") is not None:
+            px_by_key = {(p["year"], p["quarter"]): p for p in px_range}
+            px_e = px_by_key.get((latest_rev["year"], latest_rev["quarter"]))
+            if px_e and px_e.get("yoy") is not None:
+                price_yoy_1q = px_e["yoy"]
+                div_total = latest_rev["yoy"] - price_yoy_1q
+
+    pattern_hits = {}
+    if r.get("pt") and r["pt"].get("results"):
+        pattern_hits = {pr["id"]: (1 if pr.get("justBroke") else 0) for pr in r["pt"]["results"]}
+
+    return {
+        "score": dm["score"],
+        "is_breakout": 1 if sig["is_breakout"] else 0,
+        "is_pullback_rebound": 1 if sig["is_pullback_rebound"] else 0,
+        "bb_pos": sig["bb_pos"],
+        "golden_cross_recent": 1 if sig["golden_cross_recent"] else 0,
+        "kdj_golden_cross_recent": 1 if sig["kdj_golden_cross_recent"] else 0,
+        "kdj_death_cross_recent": 1 if sig["kdj_death_cross_recent"] else 0,
+        "rel_strength_20": rel_strength_20,
+        "vol_ratio": vol_ratio,
+        "pattern_formed": 1 if r["pt"]["anyFormed"] else 0,
+        "pattern_breakout": 1 if r["pt"]["anyBreakout"] else 0,
+        "pattern_just_broke": 1 if r["pt"]["anyJustBroke"] else 0,
+        "pattern_hits": pattern_hits,
+        "pb_all_pass": 1 if r["pb"]["allPass"] else 0,
+        "div_total": div_total, "price_yoy_1q": price_yoy_1q,
+    }
+
+
+def matched_pinned_combos(r):
+    flag_row = compute_live_flags_row(r)
+    d, flag_names = build_condition_flags(pd.DataFrame([flag_row]))
+    matched = []
+    for idx, combo in enumerate(PINNED_COMBOS):
+        if all(name in flag_names and bool(d.iloc[0][name]) for name in combo):
+            matched.append(idx)
+    return matched
+
+
+def matched_moonshot_combos(r):
+    flag_row = compute_live_flags_row(r)
+    d, flag_names = build_condition_flags(pd.DataFrame([flag_row]))
+    matched = []
+    for idx, combo in enumerate(MOONSHOT_COMBOS):
+        if all(name in flag_names and bool(d.iloc[0][name]) for name in combo):
+            matched.append(idx)
+    return matched
+
+
+def format_matched_combo_badges(r):
+    """回傳純文字版的指定組合命中徽章（Streamlit表格欄位用），格式例如
+    '#3 #7 M2'——#開頭是高勝率，M開頭是高標股。"""
+    try:
+        pinned_idx = matched_pinned_combos(r)
+    except Exception:
+        pinned_idx = []
+    try:
+        moonshot_idx = matched_moonshot_combos(r)
+    except Exception:
+        moonshot_idx = []
+    if not pinned_idx and not moonshot_idx:
+        return "--"
+    parts = [f"#{i+1}" for i in pinned_idx] + [f"M{i+1}" for i in moonshot_idx]
+    return " ".join(parts)
+
+
 def pinned_combo_stats(df: pd.DataFrame, combos, target_horizon: int = 10) -> pd.DataFrame:
     """算指定條件組合的表現，不受樣本數門檻或排名影響，全部顯示。缺欄位（例如
     沒勾選對應的可選資料）或沒有符合樣本的組合，也會列出來並註明原因，而不是
@@ -3935,6 +4019,7 @@ else:
             "布林通道位置": bb_pos_txt,
             "MACD狀態": macd_state_txt + combo_tag,
             "相對強弱/量比": rs_vol_txt,
+            "指定組合命中": format_matched_combo_badges(r),
             "漲跌%": round(chgp, 2), "收盤": f"${last['close']:.2f}",
         }
         if show_pe:
