@@ -3703,144 +3703,6 @@ if backtest_clicked_us:
                                  include_div=include_div_bt,
                                  min_liquidity=float(min_liquidity_wan_bt) * 10000)
 
-bt_df_us = load_backtest_df()
-if bt_df_us is not None and not bt_df_us.empty:
-    st.divider()
-    st.markdown("## 🔬 歷史回測分析結果（美股／S&P500）")
-    st.markdown(
-        f"**目前累積 {len(bt_df_us):,} 筆評估紀錄**"
-        f"（{bt_df_us['eval_date'].min()} ～ {bt_df_us['eval_date'].max()}）"
-    )
-
-    st.markdown("##### 📊 評分區間 vs 實際報酬")
-    st.dataframe(analyze_score_buckets(bt_df_us), hide_index=True, use_container_width=True)
-
-    st.markdown("##### 🚀 「強勢突破盤」標記 vs 實際報酬")
-    st.dataframe(analyze_tag_hitrate(bt_df_us, "is_breakout", "強勢突破盤"), hide_index=True, use_container_width=True)
-
-    st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
-    st.dataframe(analyze_tag_hitrate(bt_df_us, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
-
-    if "golden_cross_recent" in bt_df_us.columns and bt_df_us["golden_cross_recent"].notna().any():
-        st.markdown("##### ⚡ 「MACD近3日內黃金交叉」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "golden_cross_recent", "MACD黃金交叉"), hide_index=True, use_container_width=True)
-
-    if "kdj_golden_cross_recent" in bt_df_us.columns and bt_df_us["kdj_golden_cross_recent"].notna().any():
-        st.markdown("##### 🟢 「KDJ近3日內黃金交叉」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_golden_cross_recent", "KDJ黃金交叉"), hide_index=True, use_container_width=True)
-
-    if "kdj_death_cross_recent" in bt_df_us.columns and bt_df_us["kdj_death_cross_recent"].notna().any():
-        st.markdown("##### 🔴 「KDJ近3日內死亡交叉」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_death_cross_recent", "KDJ死亡交叉"), hide_index=True, use_container_width=True)
-
-    if "rel_strength_20" in bt_df_us.columns and bt_df_us["rel_strength_20"].notna().any():
-        bt_df_us["rel_strength_positive"] = (bt_df_us["rel_strength_20"] > 0).astype("Int64")
-        bt_df_us.loc[bt_df_us["rel_strength_20"].isna(), "rel_strength_positive"] = pd.NA
-        st.markdown("##### 💪 「相對強弱(vs大盤SPY，20日)」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "rel_strength_positive", "相對強弱為正"), hide_index=True, use_container_width=True)
-
-    if "vol_ratio" in bt_df_us.columns and bt_df_us["vol_ratio"].notna().any():
-        bt_df_us["vol_surge_15"] = (bt_df_us["vol_ratio"] >= 1.5).astype("Int64")
-        bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_15"] = pd.NA
-        bt_df_us["vol_surge_2"] = (bt_df_us["vol_ratio"] >= 2).astype("Int64")
-        bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_2"] = pd.NA
-        st.markdown("##### 📊 「爆量(≥1.5倍均量)」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_15", "爆量1.5倍"), hide_index=True, use_container_width=True)
-        st.markdown("##### 📊 「爆量(≥2倍均量)」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_2", "爆量2倍"), hide_index=True, use_container_width=True)
-
-    if "pattern_breakout" in bt_df_us.columns and bt_df_us["pattern_breakout"].notna().any():
-        st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
-
-    if "pattern_just_broke" in bt_df_us.columns and bt_df_us["pattern_just_broke"].notna().any():
-        st.markdown("##### 🔥 「型態剛形成(剛突破)」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_just_broke", "型態剛形成"), hide_index=True, use_container_width=True)
-
-    if "pb_all_pass" in bt_df_us.columns and bt_df_us["pb_all_pass"].notna().any():
-        st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
-        st.dataframe(analyze_tag_hitrate(bt_df_us, "pb_all_pass", "回後買上漲全通過"), hide_index=True, use_container_width=True)
-
-    pattern_hits_df_us = analyze_pattern_hits(bt_df_us)
-    if not pattern_hits_df_us.empty:
-        st.markdown("##### 📐 15種型態各自「剛形成」vs 實際報酬")
-        st.caption("依樣本數由多到少排序，樣本數<10筆的型態不列出（資料太少沒有參考意義）。這是每種型態單獨、不跟其他條件混在一起的乾淨表現。")
-        st.dataframe(pattern_hits_df_us, hide_index=True, use_container_width=True)
-
-    st.markdown("##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）")
-    st.caption(
-        "⚠️ 這是在已收集的歷史資料上找『表現較好』的參數組合，樣本數有限時容易"
-        "過度適配——建議當作方向參考，人工確認合理後再手動調整正式評分公式，"
-        "不要照單全收直接套用。"
-    )
-    horizon_choice_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="grid_horizon_us")
-    grid_df_us = grid_search_params(bt_df_us, target_horizon=horizon_choice_us)
-    if not grid_df_us.empty:
-        st.dataframe(grid_df_us, hide_index=True, use_container_width=True)
-    else:
-        st.caption("資料量還不夠做網格搜尋分析（需要至少20筆訊號才會列入單一組合）。")
-
-    st.markdown("##### 🧩 多因子複選搜尋（找出哪幾項欄位組合起來勝率最高）")
-    st.caption(
-        "窮舉1~3個條件旗標（分數門檻、強勢突破盤、跌深反彈盤、布林通道位置、"
-        "型態確認、乖離度…）的AND組合，看哪個組合的勝率/平均報酬最好。美股沒有"
-        "三大法人買賣超這種資料，旗標池跟台股版不同。⚠️ 測試的組合越多，純粹"
-        "運氣好而表現突出的組合也會越多（多重比較問題），下面會顯示總共測了"
-        "幾種組合——組合數越多，排在前面的結果就越需要保留懷疑，不代表真的"
-        "有效，建議搭配樣本數一起看，樣本數太小（例如剛好卡在門檻附近）的組合"
-        "更不可信。"
-    )
-    combo_horizon_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="combo_horizon_us")
-    combo_min_samples_us = st.number_input("最小樣本數門檻", min_value=10, max_value=1000, value=50, step=10, key="combo_min_samples_us")
-    combo_df_us, combos_tested_us = combo_search(bt_df_us, target_horizon=combo_horizon_us, min_samples=combo_min_samples_us)
-    st.caption(f"共測試了 {combos_tested_us:,} 種條件組合")
-    if not combo_df_us.empty:
-        st.dataframe(combo_df_us, hide_index=True, use_container_width=True)
-    else:
-        st.caption("目前沒有任何組合的樣本數達到門檻，試著調低最小樣本數，或先累積更多回測資料。")
-
-    st.markdown("##### 🎯 指定組合追蹤")
-    st.caption(
-        "22組（2026-09-21美股自己的回測結果，是真正驗證過的資料，不是移植台股"
-        "的假設清單），不受上面的樣本數門檻或排名影響，一律顯示（含備註說明"
-        "為什麼樣本數是0）。"
-    )
-    pinned_df_us = pinned_combo_stats(bt_df_us, PINNED_COMBOS, target_horizon=combo_horizon_us)
-    st.dataframe(pinned_df_us, hide_index=True, use_container_width=True)
-
-    st.markdown("##### 🚀 飆股搜尋（找出最容易出現大行情的組合）")
-    st.caption(
-        "這裡看的不是『平均勝率』，是『這個組合出現後，有多高比例會在N天內飆漲"
-        "超過門檻%』——一個組合平均報酬普通，只要常常噴出大行情，一樣會排在前面。"
-        "⚠️ 飆股本來就是稀有事件，樣本數少時『飆股比例』很容易被少數幾次極端行情"
-        "撐出虛高的數字，務必搭配『飆股次數』一起看，次數只有個位數的不建議當真。"
-        "從沒出現過飆股的組合不會列出來。"
-    )
-    ms_col1_us, ms_col2_us = st.columns(2)
-    moonshot_horizon_us = ms_col1_us.selectbox("天數", BACKTEST_HORIZONS, index=1, key="moonshot_horizon_us")
-    moonshot_threshold_us = ms_col2_us.number_input("漲幅門檻(%)", min_value=5, max_value=200, value=30, step=5, key="moonshot_threshold_us")
-    moonshot_df_us, moonshot_combos_tested_us = find_moonshot_combos(
-        bt_df_us, target_horizon=moonshot_horizon_us, threshold=moonshot_threshold_us
-    )
-    st.caption(f"共測試了 {moonshot_combos_tested_us:,} 種條件組合，其中有飆股紀錄的列在下面：")
-    if not moonshot_df_us.empty:
-        st.dataframe(moonshot_df_us, hide_index=True, use_container_width=True)
-    else:
-        st.caption("目前沒有任何組合出現過符合門檻的飆股，可以試著調低漲幅門檻，或先累積更多回測資料。")
-
-    st.markdown(f"##### 🚀 高標股追蹤（指定{len(MOONSHOT_COMBOS)}組）")
-    st.caption(
-        "來源：2026-09-21美股飆股搜尋（10日/20日，漲幅門檻30%）的原始紀錄，固定"
-        "顯示這23組（不隨你目前的回測資料重算）。每組視當初出現在哪張榜單（10/20日），"
-        "列出樣本數、飆股次數、飆股比例%、飆股平均漲幅%。⚠️ 這是『命中大行情的比例』，"
-        "不是整體勝率——跟上面的『🎯指定組合追蹤』(高勝率) 是不同的分類，飆股比例高"
-        "不代表整體勝率高，兩者要分開看。多數組合樣本數只有20-80筆，飆股次數常常"
-        "只有個位數，數字僅供參考方向。"
-    )
-    st.dataframe(moonshot_combo_static_stats(MOONSHOT_COMBOS, MOONSHOT_COMBO_STATS),
-                 hide_index=True, use_container_width=True)
-
-
 if "batch_results" not in st.session_state:
     st.info("📈 請在左側輸入 Financial Modeling Prep API Key 與美股代號，點擊「批次分析」即可開始。")
 else:
@@ -4317,3 +4179,149 @@ else:
                     "BB下軌": round(d["bbL"], 2) if d.get("bbL") is not None else None,
                 })
             st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
+
+
+# ────────────────────────────────────────────────────────────────
+# 歷史回測分析結果（放在批次分析結果後面，避免資料庫累積大量歷史紀錄後，
+# 這一大段內容把批次分析摘要往下推，讓人誤以為批次分析「跑完跳轉不出來」）
+# ────────────────────────────────────────────────────────────────
+
+bt_df_us = load_backtest_df()
+if bt_df_us is not None and not bt_df_us.empty:
+    st.divider()
+    with st.expander("🔬 歷史回測分析結果（點開查看，累積 " + f"{len(bt_df_us):,}" + " 筆評估紀錄）", expanded=backtest_clicked_us):
+        st.markdown("## 🔬 歷史回測分析結果（美股／S&P500）")
+        st.markdown(
+            f"**目前累積 {len(bt_df_us):,} 筆評估紀錄**"
+            f"（{bt_df_us['eval_date'].min()} ～ {bt_df_us['eval_date'].max()}）"
+        )
+
+        st.markdown("##### 📊 評分區間 vs 實際報酬")
+        st.dataframe(analyze_score_buckets(bt_df_us), hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🚀 「強勢突破盤」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "is_breakout", "強勢突破盤"), hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df_us, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
+
+        if "golden_cross_recent" in bt_df_us.columns and bt_df_us["golden_cross_recent"].notna().any():
+            st.markdown("##### ⚡ 「MACD近3日內黃金交叉」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "golden_cross_recent", "MACD黃金交叉"), hide_index=True, use_container_width=True)
+
+        if "kdj_golden_cross_recent" in bt_df_us.columns and bt_df_us["kdj_golden_cross_recent"].notna().any():
+            st.markdown("##### 🟢 「KDJ近3日內黃金交叉」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_golden_cross_recent", "KDJ黃金交叉"), hide_index=True, use_container_width=True)
+
+        if "kdj_death_cross_recent" in bt_df_us.columns and bt_df_us["kdj_death_cross_recent"].notna().any():
+            st.markdown("##### 🔴 「KDJ近3日內死亡交叉」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "kdj_death_cross_recent", "KDJ死亡交叉"), hide_index=True, use_container_width=True)
+
+        if "rel_strength_20" in bt_df_us.columns and bt_df_us["rel_strength_20"].notna().any():
+            bt_df_us["rel_strength_positive"] = (bt_df_us["rel_strength_20"] > 0).astype("Int64")
+            bt_df_us.loc[bt_df_us["rel_strength_20"].isna(), "rel_strength_positive"] = pd.NA
+            st.markdown("##### 💪 「相對強弱(vs大盤SPY，20日)」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "rel_strength_positive", "相對強弱為正"), hide_index=True, use_container_width=True)
+
+        if "vol_ratio" in bt_df_us.columns and bt_df_us["vol_ratio"].notna().any():
+            bt_df_us["vol_surge_15"] = (bt_df_us["vol_ratio"] >= 1.5).astype("Int64")
+            bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_15"] = pd.NA
+            bt_df_us["vol_surge_2"] = (bt_df_us["vol_ratio"] >= 2).astype("Int64")
+            bt_df_us.loc[bt_df_us["vol_ratio"].isna(), "vol_surge_2"] = pd.NA
+            st.markdown("##### 📊 「爆量(≥1.5倍均量)」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_15", "爆量1.5倍"), hide_index=True, use_container_width=True)
+            st.markdown("##### 📊 「爆量(≥2倍均量)」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_2", "爆量2倍"), hide_index=True, use_container_width=True)
+
+        if "pattern_breakout" in bt_df_us.columns and bt_df_us["pattern_breakout"].notna().any():
+            st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
+
+        if "pattern_just_broke" in bt_df_us.columns and bt_df_us["pattern_just_broke"].notna().any():
+            st.markdown("##### 🔥 「型態剛形成(剛突破)」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "pattern_just_broke", "型態剛形成"), hide_index=True, use_container_width=True)
+
+        if "pb_all_pass" in bt_df_us.columns and bt_df_us["pb_all_pass"].notna().any():
+            st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "pb_all_pass", "回後買上漲全通過"), hide_index=True, use_container_width=True)
+
+        pattern_hits_df_us = analyze_pattern_hits(bt_df_us)
+        if not pattern_hits_df_us.empty:
+            st.markdown("##### 📐 15種型態各自「剛形成」vs 實際報酬")
+            st.caption("依樣本數由多到少排序，樣本數<10筆的型態不列出（資料太少沒有參考意義）。這是每種型態單獨、不跟其他條件混在一起的乾淨表現。")
+            st.dataframe(pattern_hits_df_us, hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）")
+        st.caption(
+            "⚠️ 這是在已收集的歷史資料上找『表現較好』的參數組合，樣本數有限時容易"
+            "過度適配——建議當作方向參考，人工確認合理後再手動調整正式評分公式，"
+            "不要照單全收直接套用。"
+        )
+        horizon_choice_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="grid_horizon_us")
+        grid_df_us = grid_search_params(bt_df_us, target_horizon=horizon_choice_us)
+        if not grid_df_us.empty:
+            st.dataframe(grid_df_us, hide_index=True, use_container_width=True)
+        else:
+            st.caption("資料量還不夠做網格搜尋分析（需要至少20筆訊號才會列入單一組合）。")
+
+        st.markdown("##### 🧩 多因子複選搜尋（找出哪幾項欄位組合起來勝率最高）")
+        st.caption(
+            "窮舉1~3個條件旗標（分數門檻、強勢突破盤、跌深反彈盤、布林通道位置、"
+            "型態確認、乖離度…）的AND組合，看哪個組合的勝率/平均報酬最好。美股沒有"
+            "三大法人買賣超這種資料，旗標池跟台股版不同。⚠️ 測試的組合越多，純粹"
+            "運氣好而表現突出的組合也會越多（多重比較問題），下面會顯示總共測了"
+            "幾種組合——組合數越多，排在前面的結果就越需要保留懷疑，不代表真的"
+            "有效，建議搭配樣本數一起看，樣本數太小（例如剛好卡在門檻附近）的組合"
+            "更不可信。"
+        )
+        combo_horizon_us = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="combo_horizon_us")
+        combo_min_samples_us = st.number_input("最小樣本數門檻", min_value=10, max_value=1000, value=50, step=10, key="combo_min_samples_us")
+        combo_df_us, combos_tested_us = combo_search(bt_df_us, target_horizon=combo_horizon_us, min_samples=combo_min_samples_us)
+        st.caption(f"共測試了 {combos_tested_us:,} 種條件組合")
+        if not combo_df_us.empty:
+            st.dataframe(combo_df_us, hide_index=True, use_container_width=True)
+        else:
+            st.caption("目前沒有任何組合的樣本數達到門檻，試著調低最小樣本數，或先累積更多回測資料。")
+
+        st.markdown("##### 🎯 指定組合追蹤")
+        st.caption(
+            "22組（2026-09-21美股自己的回測結果，是真正驗證過的資料，不是移植台股"
+            "的假設清單），不受上面的樣本數門檻或排名影響，一律顯示（含備註說明"
+            "為什麼樣本數是0）。"
+        )
+        pinned_df_us = pinned_combo_stats(bt_df_us, PINNED_COMBOS, target_horizon=combo_horizon_us)
+        st.dataframe(pinned_df_us, hide_index=True, use_container_width=True)
+
+        st.markdown("##### 🚀 飆股搜尋（找出最容易出現大行情的組合）")
+        st.caption(
+            "這裡看的不是『平均勝率』，是『這個組合出現後，有多高比例會在N天內飆漲"
+            "超過門檻%』——一個組合平均報酬普通，只要常常噴出大行情，一樣會排在前面。"
+            "⚠️ 飆股本來就是稀有事件，樣本數少時『飆股比例』很容易被少數幾次極端行情"
+            "撐出虛高的數字，務必搭配『飆股次數』一起看，次數只有個位數的不建議當真。"
+            "從沒出現過飆股的組合不會列出來。"
+        )
+        ms_col1_us, ms_col2_us = st.columns(2)
+        moonshot_horizon_us = ms_col1_us.selectbox("天數", BACKTEST_HORIZONS, index=1, key="moonshot_horizon_us")
+        moonshot_threshold_us = ms_col2_us.number_input("漲幅門檻(%)", min_value=5, max_value=200, value=30, step=5, key="moonshot_threshold_us")
+        moonshot_df_us, moonshot_combos_tested_us = find_moonshot_combos(
+            bt_df_us, target_horizon=moonshot_horizon_us, threshold=moonshot_threshold_us
+        )
+        st.caption(f"共測試了 {moonshot_combos_tested_us:,} 種條件組合，其中有飆股紀錄的列在下面：")
+        if not moonshot_df_us.empty:
+            st.dataframe(moonshot_df_us, hide_index=True, use_container_width=True)
+        else:
+            st.caption("目前沒有任何組合出現過符合門檻的飆股，可以試著調低漲幅門檻，或先累積更多回測資料。")
+
+        st.markdown(f"##### 🚀 高標股追蹤（指定{len(MOONSHOT_COMBOS)}組）")
+        st.caption(
+            "來源：2026-09-21美股飆股搜尋（10日/20日，漲幅門檻30%）的原始紀錄，固定"
+            "顯示這23組（不隨你目前的回測資料重算）。每組視當初出現在哪張榜單（10/20日），"
+            "列出樣本數、飆股次數、飆股比例%、飆股平均漲幅%。⚠️ 這是『命中大行情的比例』，"
+            "不是整體勝率——跟上面的『🎯指定組合追蹤』(高勝率) 是不同的分類，飆股比例高"
+            "不代表整體勝率高，兩者要分開看。多數組合樣本數只有20-80筆，飆股次數常常"
+            "只有個位數，數字僅供參考方向。"
+        )
+        st.dataframe(moonshot_combo_static_stats(MOONSHOT_COMBOS, MOONSHOT_COMBO_STATS),
+                     hide_index=True, use_container_width=True)
+
+
