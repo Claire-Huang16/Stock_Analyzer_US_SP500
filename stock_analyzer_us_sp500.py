@@ -649,6 +649,13 @@ def fetch_benchmark_series(token: str, days: int):
         [{"date": d["date"], "close": float(d["close"])} for d in rows],
         key=lambda x: x["date"],
     )
+    # 順便把大盤自己的20日/60日均線也算好，市場狀態濾網（大盤站上/跌破均線）要用，
+    # 這裡一次算完整條序列，比逐個評估點現算快很多。
+    for i in range(len(arr)):
+        if i >= 19:
+            arr[i]["ma20"] = sum(arr[j]["close"] for j in range(i - 19, i + 1)) / 20
+        if i >= 59:
+            arr[i]["ma60"] = sum(arr[j]["close"] for j in range(i - 59, i + 1)) / 60
     date_idx = {bar["date"]: i for i, bar in enumerate(arr)}
     return {"arr": arr, "date_idx": date_idx}
 
@@ -660,6 +667,22 @@ def find_benchmark_idx(benchmark: dict, date_str: str):
         if benchmark["arr"][i]["date"] <= date_str:
             return i
     return -1
+
+
+def compute_benchmark_regime(benchmark: dict, date_str: str):
+    """市場狀態濾網：評估當下大盤自己站在20日/60日均線的上面還下面。跟相對強弱
+    不同——相對強弱看的是「這檔股票 vs 大盤」，這個看的是「大盤自己的多空位置」，
+    用同一份benchmark資料算，不用多打API。回傳 (above20, above60)，可能是
+    True/False/None。"""
+    if not benchmark:
+        return None, None
+    idx = find_benchmark_idx(benchmark, date_str)
+    if idx < 0:
+        return None, None
+    bar = benchmark["arr"][idx]
+    above20 = (bar["close"] > bar["ma20"]) if "ma20" in bar else None
+    above60 = (bar["close"] > bar["ma60"]) if "ma60" in bar else None
+    return above20, above60
 
 
 def compute_relative_strength(data, benchmark, lookback: int = 20):
@@ -2517,6 +2540,8 @@ def init_backtest_table():
         "pattern_hits_json TEXT",
         "rel_strength_20 REAL",
         "vol_ratio REAL",
+        "benchmark_above20 INTEGER",
+        "benchmark_above60 INTEGER",
     ]:
         try:
             conn.execute(f"ALTER TABLE backtest_evals ADD COLUMN {col_def}")
@@ -2628,6 +2653,7 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                 sig = compute_core_signals(data_slice, dm)
                 rel_strength_20 = compute_relative_strength(data_slice, benchmark, 20) if benchmark else None
                 vol_ratio = compute_vol_ratio(data_slice)
+                above20, above60 = compute_benchmark_regime(benchmark, eval_date) if benchmark else (None, None)
 
                 pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass = None, None, None, None
                 pattern_hits_json = None
@@ -2660,8 +2686,8 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                      pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
                      div_total, price_yoy_1q, golden_cross_recent,
                      kdj_golden_cross_recent, kdj_death_cross_recent, pattern_hits_json,
-                     rel_strength_20, vol_ratio, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     rel_strength_20, vol_ratio, benchmark_above20, benchmark_above60, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     eval_date, sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
                     sig["bb_pos"], int(sig["is_breakout"]), int(sig["is_pullback_rebound"]), entry_close,
@@ -2670,6 +2696,7 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                     div_total, price_yoy_1q, int(sig["golden_cross_recent"]),
                     int(sig["kdj_golden_cross_recent"]), int(sig["kdj_death_cross_recent"]), pattern_hits_json,
                     rel_strength_20, vol_ratio,
+                    None if above20 is None else int(above20), None if above60 is None else int(above60),
                     datetime.now().isoformat(timespec="seconds"),
                 ))
                 saved_rows += 1
@@ -2844,6 +2871,12 @@ def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
     if "vol_ratio" in d.columns and d["vol_ratio"].notna().any():
         flags["爆量(≥1.5倍均量)"] = d["vol_ratio"] >= 1.5
         flags["爆量(≥2倍均量)"] = d["vol_ratio"] >= 2
+    if "benchmark_above20" in d.columns and d["benchmark_above20"].notna().any():
+        flags["大盤站上20日均線"] = d["benchmark_above20"] == 1
+        flags["大盤跌破20日均線"] = d["benchmark_above20"] == 0
+    if "benchmark_above60" in d.columns and d["benchmark_above60"].notna().any():
+        flags["大盤站上60日均線"] = d["benchmark_above60"] == 1
+        flags["大盤跌破60日均線"] = d["benchmark_above60"] == 0
 
     if "pattern_formed" in d.columns and d["pattern_formed"].notna().any():
         flags["型態成形中"] = d["pattern_formed"] == 1
@@ -3159,6 +3192,8 @@ def compute_live_flags_row(r):
     sig = compute_core_signals(r["data"], dm)
     rel_strength_20 = compute_relative_strength(r["data"], current_benchmark, 20) if current_benchmark else None
     vol_ratio = compute_vol_ratio(r["data"])
+    last_date = r["data"][-1]["date"]
+    above20, above60 = compute_benchmark_regime(current_benchmark, last_date) if current_benchmark else (None, None)
 
     rev = r.get("revRange")
     px_range = r.get("priceYoYRange")
@@ -3186,6 +3221,8 @@ def compute_live_flags_row(r):
         "kdj_death_cross_recent": 1 if sig["kdj_death_cross_recent"] else 0,
         "rel_strength_20": rel_strength_20,
         "vol_ratio": vol_ratio,
+        "benchmark_above20": None if above20 is None else (1 if above20 else 0),
+        "benchmark_above60": None if above60 is None else (1 if above60 else 0),
         "pattern_formed": 1 if r["pt"]["anyFormed"] else 0,
         "pattern_breakout": 1 if r["pt"]["anyBreakout"] else 0,
         "pattern_just_broke": 1 if r["pt"]["anyJustBroke"] else 0,
@@ -3710,6 +3747,24 @@ else:
 
     st.markdown("### 📋 批次分析摘要")
 
+    with st.expander(f"📖「指定組合命中」編號對照 — 高勝率 {len(PINNED_COMBOS)}組／高標股 {len(MOONSHOT_COMBOS)}組（點開查看完整條件）"):
+        st.markdown("**⬥ 高勝率（#編號）**")
+        if PINNED_COMBOS:
+            for idx, combo in enumerate(PINNED_COMBOS):
+                key = " ＋ ".join(combo)
+                wr_txt = format_winrates(PINNED_COMBO_WINRATES.get(key))
+                st.markdown(f"`#{idx+1}` {key}" + (f"　（歷史勝率：{wr_txt}）" if wr_txt else ""))
+        else:
+            st.caption("目前清單是空的。")
+        st.markdown("**⬥ 高標股（M編號，容易命中大行情，不代表整體勝率高）**")
+        if MOONSHOT_COMBOS:
+            for idx, combo in enumerate(MOONSHOT_COMBOS):
+                key = " ＋ ".join(combo)
+                stats_txt = format_moonshot_stats(MOONSHOT_COMBO_STATS.get(key))
+                st.markdown(f"`M{idx+1}` {key}" + (f"　（{stats_txt}）" if stats_txt else ""))
+        else:
+            st.caption("目前清單是空的。")
+
     fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1, 1.4])
     with fcol1:
         pb_filter = st.selectbox("進場條件", ["全部", "✅ 符合進場", "❌ 不符合"], key="pb_filter")
@@ -3974,6 +4029,27 @@ else:
         m3.metric("量比 vs MA20", f"{vr:.2f}x", "放量" if vr > 1.2 else ("縮量" if vr < 0.8 else "正常"))
         m4.metric("資料日期", last["date"])
 
+        try:
+            pinned_idx = matched_pinned_combos(r)
+        except Exception:
+            pinned_idx = []
+        try:
+            moonshot_idx = matched_moonshot_combos(r)
+        except Exception:
+            moonshot_idx = []
+        if pinned_idx or moonshot_idx:
+            st.markdown("##### 🎯 指定組合命中細節")
+            for idx in pinned_idx:
+                combo = PINNED_COMBOS[idx]
+                key = " ＋ ".join(combo)
+                wr_txt = format_winrates(PINNED_COMBO_WINRATES.get(key))
+                st.success(f"**#{idx+1}** {key}" + (f"　（歷史勝率：{wr_txt}）" if wr_txt else ""))
+            for idx in moonshot_idx:
+                combo = MOONSHOT_COMBOS[idx]
+                key = " ＋ ".join(combo)
+                stats_txt = format_moonshot_stats(MOONSHOT_COMBO_STATS.get(key))
+                st.warning(f"**M{idx+1}** {key}" + (f"　（{stats_txt}）" if stats_txt else ""))
+
         st.divider()
         st.markdown("### 📊 多方力道評分")
         sc1, sc2 = st.columns([1, 2])
@@ -4232,6 +4308,13 @@ if bt_df_us is not None and not bt_df_us.empty:
             st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_15", "爆量1.5倍"), hide_index=True, use_container_width=True)
             st.markdown("##### 📊 「爆量(≥2倍均量)」標記 vs 實際報酬")
             st.dataframe(analyze_tag_hitrate(bt_df_us, "vol_surge_2", "爆量2倍"), hide_index=True, use_container_width=True)
+
+        if "benchmark_above20" in bt_df_us.columns and bt_df_us["benchmark_above20"].notna().any():
+            st.markdown("##### 🌐 「大盤站上20日均線」標記 vs 實際報酬（市場狀態濾網）")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "benchmark_above20", "大盤站上20日均線"), hide_index=True, use_container_width=True)
+        if "benchmark_above60" in bt_df_us.columns and bt_df_us["benchmark_above60"].notna().any():
+            st.markdown("##### 🌐 「大盤站上60日均線」標記 vs 實際報酬（市場狀態濾網）")
+            st.dataframe(analyze_tag_hitrate(bt_df_us, "benchmark_above60", "大盤站上60日均線"), hide_index=True, use_container_width=True)
 
         if "pattern_breakout" in bt_df_us.columns and bt_df_us["pattern_breakout"].notna().any():
             st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
