@@ -2195,8 +2195,8 @@ def summary_frame(results, extras_flags, K, live=None):
     df = pd.DataFrame(recs)
     if not len(df):
         return df
-    # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數
-    df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數'], errors='ignore')
+    # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
+    df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
     front = ['股票', '名稱', '股價', '漲跌幅%', '選股型命中', '指定組合命中', '型態確認']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
