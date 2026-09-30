@@ -1574,19 +1574,6 @@ FMP_BASE = 'https://financialmodelingprep.com/stable'
 RATE_LIMIT_PER_MIN = 280
 MARKET_SCAN_CONCURRENCY = 20
 _http = requests.Session()
-_tls = threading.local()
-
-
-def _session():
-    """每個執行緒各用一個 Session（requests.Session 跨執行緒共用不保證安全，平行回測時可能卡住）"""
-    s = getattr(_tls, 's', None)
-    if s is None:
-        s = requests.Session()
-        ad = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4)
-        s.mount('https://', ad)
-        s.mount('http://', ad)
-        _tls.s = s
-    return s
 _rl_lock = threading.Lock()
 _rl_times = []
 
@@ -1614,21 +1601,9 @@ def to_fmp_symbol(sid):
     return sid.replace('.', '-')
 
 
-def fmp_get(path, params, token, timeout=(10, 25), retries=2):
-    """連線逾時／中斷、429（超過每分鐘上限）、5xx 會自動重試 2 次（間隔遞增）"""
-    for attempt in range(retries + 1):
-        rate_limit_acquire()
-        try:
-            r = _session().get(FMP_BASE + path, params={**params, 'apikey': token}, timeout=timeout)
-        except (requests.Timeout, requests.ConnectionError) as ex:
-            if attempt < retries:
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise RuntimeError(f'連線逾時／中斷（{type(ex).__name__}）')
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-            time.sleep(5 * (attempt + 1) if r.status_code == 429 else 2 * (attempt + 1))
-            continue
-        break
+def fmp_get(path, params, token, timeout=30):
+    rate_limit_acquire()
+    r = _http.get(FMP_BASE + path, params={**params, 'apikey': token}, timeout=timeout)
     try:
         j = r.json()
     except Exception:  # noqa
@@ -1994,8 +1969,7 @@ def prep_analysis_df(df, min_px=5.0, wq=0.01):
 
 
 def run_backtest(token, universe, months_back, include_div, include_sector, min_liq, vp_params,
-                 delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
-                 stock_timeout=150, stall_timeout=300):
+                 delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
     universe 可以是全美股約3000檔（fetch_market_universe），時間主要花在 API：3000檔約需 11～15 分鐘。"""
     buf = 60
@@ -2074,93 +2048,34 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
 
     frames, fail_reasons = [], {}
     saved = failed = done = 0
-    from concurrent.futures import wait, FIRST_COMPLETED
-    running = {}                      # sid -> 開始處理的時間（看門狗用）
-    rlock = threading.Lock()
-
-    def job(sid):
-        with rlock:
-            running[sid] = time.time()
-        try:
-            return one(sid)
-        finally:
-            with rlock:
-                running.pop(sid, None)
-
-    def fail(err):
-        nonlocal failed
-        failed += 1
-        fail_reasons[err] = fail_reasons.get(err, 0) + 1
-
-    # 看門狗：單檔處理超過 stock_timeout 秒就略過（不再等它）；整體超過 stall_timeout 秒沒有任何一檔完成就中止，
-    # 並把卡住的代號回報出來——避免畫面停在某個進度卻看不出是慢還是卡死。
-    t_start = last_progress = time.time()
-    stopped_msg = None
-    pool = ThreadPoolExecutor(max(1, workers))
-    try:
-        fut_sid = {pool.submit(job, sid): sid for sid in universe}
-        pending = set(fut_sid)
-        abandoned = set()
-        while pending:
-            done_set, pending = wait(pending, timeout=3, return_when=FIRST_COMPLETED)
-            for fut in done_set:
-                sid = fut_sid[fut]
-                if sid in abandoned or fut.cancelled():
-                    continue
-                try:
-                    d, err = fut.result()
-                except Exception as ex:  # noqa
-                    d, err = None, str(ex)
-                done += 1
-                last_progress = time.time()
-                if d is not None:
-                    frames.append(d)
-                    saved += len(d)
-                else:
-                    fail(err)
-                if on_progress:
-                    on_progress(done, total, saved, failed, sid)
-            now = time.time()
-            with rlock:
-                slow = [(sid_, now - t0) for sid_, t0 in running.items() if now - t0 > stock_timeout and sid_ not in abandoned]
-            for sid_, _ in slow:      # 放棄等待這一檔（執行緒本身無法強制中止，但結果會被忽略）
-                abandoned.add(sid_)
-                done += 1
-                fail(f'逾時（超過{stock_timeout}秒沒有回應，已略過）')
-                pending = {f for f in pending if fut_sid[f] != sid_}
-                last_progress = now
+    from concurrent.futures import as_completed
+    with ThreadPoolExecutor(max(1, workers)) as pool:
+        futs = {pool.submit(one, sid): sid for sid in universe}
+        for fut in as_completed(futs):
+            sid = futs[fut]
+            d, err = fut.result()
+            done += 1
+            if d is not None:
+                frames.append(d)
+                saved += len(d)
+            else:
+                failed += 1
+                fail_reasons[err] = fail_reasons.get(err, 0) + 1
             if on_progress:
-                with rlock:
-                    busy = sorted([kv for kv in running.items() if kv[0] not in abandoned], key=lambda kv: kv[1])
-                el = now - t_start
-                eta = el / done * (total - done) if done else None
-                note = (f'已用 {el / 60:.1f} 分' + (f'，預估剩 {eta / 60:.0f} 分' if eta is not None else '')
-                        + (f'｜處理中 {len(busy)} 檔，最久 {busy[0][0]} {now - busy[0][1]:.0f}秒' if busy else ''))
-                on_progress(done, total, saved, failed, None, note)
-            if should_stop and should_stop():
-                stopped_msg = '使用者中止'
-            elif done >= 10 and saved == 0 and failed >= 10:
-                stopped_msg = '前10檔全部失敗（多半是 API Key／額度／方案問題）'
-            elif now - last_progress > stall_timeout:
-                with rlock:
-                    stuck = ', '.join(k for k in running if k not in abandoned)
-                stopped_msg = f'超過{stall_timeout // 60}分鐘沒有任何一檔完成（卡住的代號：{stuck or "無"}），已中止並保留已完成的結果'
-            if stopped_msg:
-                for f in pending:
+                on_progress(done, total, saved, failed, sid)
+            stop = (should_stop and should_stop()) or (done >= 10 and saved == 0 and failed >= 10)
+            if stop:   # 前10檔全失敗：多半是Key/額度/方案問題，提早結束
+                for f in futs:
                     f.cancel()
-                if '前10檔' not in stopped_msg:
-                    fail_reasons[stopped_msg] = fail_reasons.get(stopped_msg, 0) + 1
                 break
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)   # 不等卡住的執行緒
     if on_progress:
-        on_progress(total, total, saved, failed, None, '')
+        on_progress(total, total, saved, failed, None)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if len(df):
         df['evalDate'] = df['evalDate'].astype(str)
         df = df.sort_values(['evalDate', 'stockId']).reset_index(drop=True)
     top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:5]
-    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg,
+    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err,
                     top_fail=[f'{m}（{c}次）' for m, c in top])
 
 
@@ -3137,20 +3052,13 @@ def main():
             prog = st.progress(0.0, text='🔬 歷史回測執行中...')
             det = st.empty()
 
-            last_sid = {'v': ''}
-
-            def onp(i, total, saved, failed, sid, note=None):
-                if sid:
-                    last_sid['v'] = sid
+            def onp(i, total, saved, failed, sid):
                 prog.progress(min(1.0, i / max(total, 1)),
                               text=f'🔬 歷史回測執行中（過去{bt_months}個月）：{i} / {total}')
-                det.caption((f'最近完成：{last_sid["v"]}　' if i < total else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔'
-                            + (f'　｜{note}' if note else ''))
+                det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔')
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp,
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx))
             prog.empty()
-            if stt.get('stopped'):
-                st.warning(f"⚠️ 回測提前結束：{stt['stopped']}")
             if stt.get('bm_err'):
                 st.warning(f"⚠️ 這次回測抓不到大盤(SPY)資料，相對強弱／大盤濾網不會出現：{stt['bm_err']}")
             if not len(df):
