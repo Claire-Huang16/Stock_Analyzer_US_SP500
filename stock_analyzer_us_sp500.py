@@ -1803,6 +1803,63 @@ _profile_cache = {}
 _sector_bm_cache = {}
 
 
+# ── 下一個財報公布日 ──
+# 先用 /earnings-calendar 一次抓未來約150天全市場的財報日（每次最多90天，分兩段），
+# 清單裡找不到的個股再用 /earnings?symbol= 單檔補抓（ETF 等沒有財報的會顯示「--」）。
+EARNINGS_DAYS_AHEAD = 150
+
+
+def _earn_item(x):
+    d = str(x.get('date') or '')[:10]
+    t = str(x.get('time') or '').lower()
+    return dict(date=d, time=('盤前' if t == 'bmo' else ('盤後' if t == 'amc' else '')),
+                epsEst=x.get('epsEstimated'), revEst=x.get('revenueEstimated'))
+
+
+def fetch_earnings_calendar(token, days_ahead=EARNINGS_DAYS_AHEAD):
+    """回傳 {FMP代號: {date, time, epsEst, revEst}}（只留今天以後最近的一次）；整段失敗時丟出例外"""
+    today = dt.date.today()
+    last = today + dt.timedelta(days=days_ahead)
+    out, start, ok = {}, today, False
+    while start <= last:
+        end = min(start + dt.timedelta(days=89), last)
+        try:
+            j = fmp_get('/earnings-calendar', {'from': _ds(start), 'to': _ds(end)}, token)
+            ok = True
+        except Exception:  # noqa
+            j = None
+        for x in (j if isinstance(j, list) else []):
+            sym = str(x.get('symbol') or '').upper()
+            it = _earn_item(x)
+            if sym and it['date'] >= _ds(today) and (sym not in out or it['date'] < out[sym]['date']):
+                out[sym] = it
+        start = end + dt.timedelta(days=1)
+    if not ok:
+        raise RuntimeError('財報行事曆讀取失敗')
+    return out
+
+
+def fetch_next_earnings(sid, token):
+    """單檔補抓：/earnings 含未來預定的財報（epsActual 為空），取今天以後最近的一次"""
+    j = fmp_get('/earnings', dict(symbol=to_fmp_symbol(sid), limit=12), token)
+    today = _ds(dt.date.today())
+    fut = sorted((_earn_item(x) for x in (j if isinstance(j, list) else []) if str(x.get('date') or '')[:10] >= today),
+                 key=lambda it: it['date'])
+    return fut[0] if fut else None
+
+
+def earnings_label(e):
+    """財報日欄位文字：2026-10-28（27天）盤後；今天／明天特別標示"""
+    if not e or not e.get('date'):
+        return '--'
+    try:
+        n = (dt.date.fromisoformat(e['date']) - dt.date.today()).days
+    except Exception:  # noqa
+        return e['date']
+    tail = '今天' if n == 0 else ('明天' if n == 1 else f'{n}天')
+    return f"{e['date']}（{tail}）" + (e.get('time') or '')
+
+
 def fetch_profile(sid, token):
     if sid in _profile_cache:
         return _profile_cache[sid]
@@ -2492,6 +2549,7 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['命中數'] = len(ms) + len(mp) + len(mm)
         # 命中類別數：S/#/M/W/F 五類中命中幾類（同類多個組合常共用同一訊號，類別數比總命中數更能反映訊號強弱）
         rec['命中類別數'] = sum(1 for x in (ms, mp, mm, mw, mf) if x)
+        rec['財報日'] = earnings_label(r.get('earnings'))
         rec['_pbPass'] = pb['allPass']
         rec['_pt'] = 'justbreak' if pt['anyJustBroke'] else ('breakout' if pt['anyBreakout'] else ('forming' if pt['anyFormed'] else 'none'))
         recs.append(rec)
@@ -2500,7 +2558,7 @@ def summary_frame(results, extras_flags, K, live=None):
         return df
     # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
     df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
-    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
+    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認', '財報日']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
 
@@ -2801,6 +2859,11 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
         log(f'⚠️ 抓不到大盤(SPY)資料，相對強弱／大盤濾網這次不會出現：{ex}')
     if ex_flags.get('sector'):
         reset_sector_cache()
+    try:
+        earn_cal = fetch_earnings_calendar(token)
+    except Exception as ex:  # noqa
+        earn_cal = None
+        log(f'⚠️ 財報行事曆讀取失敗，改為逐檔查詢財報日：{ex}')
     results = []
     for i, sid in enumerate(stocks):
         try:
@@ -2813,6 +2876,12 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
             tech = tech_extras(bl, bl.n - 1)
             extras = dict(realtime=rt, peRange=None, peRangeErr=None, revRange=None, priceYoYRange=None,
                           sector=None, sectorBenchmark=None, tech=tech)
+            extras['earnings'] = (earn_cal or {}).get(to_fmp_symbol(sid).upper())
+            if extras['earnings'] is None:
+                try:
+                    extras['earnings'] = fetch_next_earnings(sid, token)
+                except Exception:  # noqa
+                    pass
             if ex_flags.get('pe'):
                 try:
                     extras['peRange'] = fetch_pe_range(sid, token)
@@ -3535,6 +3604,13 @@ def render_batch(st, ss, K):
         for c, colr in hit_colors.items():
             if c in view.columns:
                 sty = sty.set_properties(subset=[c], **{'color': colr, 'font-weight': '600'})
+        if '財報日' in view.columns:
+            # 7天內要公布財報：橘紅色提醒（財報前後波動大）
+            def _earn_css(v):
+                m_ = re.search(r'（(\d+)天）', str(v))
+                n_ = 0 if '（今天）' in str(v) else (1 if '（明天）' in str(v) else (int(m_.group(1)) if m_ else None))
+                return 'color:#e65100;font-weight:700' if n_ is not None and n_ <= 7 else ''
+            sty = sty.map(_earn_css, subset=['財報日']) if hasattr(sty, 'map') else sty.applymap(_earn_css, subset=['財報日'])
         show_obj = sty
     except Exception:  # noqa  沒有 jinja2 等套件時退回不上色
         show_obj = view
