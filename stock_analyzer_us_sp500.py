@@ -1076,7 +1076,8 @@ def tech_extras(b, e):
     3日內突破季線／半年線、連續放量、MACD零軸下金叉。資料不足時為 None"""
     out = dict(high52Dist=None, newHigh52=None, maBull=None, bbwRank=None, gapUp3=None,
                crossMa60_3=None, crossMa100_3=None, vol3Ratio=None, gcBelow0_3=None,
-               udVolRatio20=None, cmf20=None, obvNewHigh60=None)
+               udVolRatio20=None, cmf20=None, obvNewHigh60=None,
+               bias20=None, pullMa60=None, limitUp3=None, drop5=None, nr7=None)
     if e < 0 or e >= b.n:
         return out
     if e >= 249:
@@ -1140,6 +1141,19 @@ def tech_extras(b, e):
             mx = max(mx, obv)
         obv += b.volume[e] if b.close[e] > b.close[e - 1] else (-b.volume[e] if b.close[e] < b.close[e - 1] else 0.0)
         out['obvNewHigh60'] = int(obv > mx)
+    # 2026-10-05 新增：短線乖離、多頭回測季線、近3日漲停（台股）、近5日跌幅與NR7窄幅日（美股）
+    out.update(dict(bias20=None, pullMa60=None, limitUp3=None, drop5=None, nr7=None))
+    if b.ma20[e]:
+        out['bias20'] = (b.close[e] / b.ma20[e] - 1) * 100
+    if e >= 10 and b.ma60[e] and b.ma60[e - 10]:
+        out['pullMa60'] = int(b.ma60[e] > b.ma60[e - 10] and abs(b.close[e] / b.ma60[e] - 1) <= 0.03)
+    if e >= 3:
+        out['limitUp3'] = int(any(b.close[j - 1] > 0 and b.close[j] / b.close[j - 1] - 1 >= 0.095 for j in range(e - 2, e + 1)))
+    if e >= 5 and b.close[e - 5]:
+        out['drop5'] = (b.close[e] / b.close[e - 5] - 1) * 100
+    if e >= 6:
+        rg = [b.high[j] - b.low[j] for j in range(e - 6, e + 1)]
+        out['nr7'] = int(rg[-1] < min(rg[:-1]))
     return out
 
 
@@ -1244,10 +1258,18 @@ NEW_TECH_FLAGS = [
     ('udVolRatio20', '漲時量≥跌時量1.5倍(近20日)', lambda s: s.ge(1.5)),
     ('cmf20', 'CMF資金流買方佔優(近20日≥0.1)', lambda s: s.ge(0.1)),
     ('obvNewHigh60', 'OBV能量潮創60日新高', lambda s: s.eq(1)),
+    # 2026-10-05 新增（待回測驗證）
+    ('pullMa60', '多頭回測季線(季線上揚、距季線±3%)', lambda s: s.eq(1)),
+    ('bias20', '短線過熱(高於月線≥20%)', lambda s: s.ge(20)),
+    ('drop5', '近5日跌幅≥8%(短線超跌)', lambda s: s.le(-8)),
+    ('nr7', 'NR7窄幅日(近7日振幅最小)', lambda s: s.eq(1)),
 ]
 # 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
 SEARCH_EXCLUDE_FLAGS = {'型態成形中', '型態突破確認', '型態剛形成(剛突破)', '突破上升軌道線剛形成',
                         '分價量表-守穩POC買進', '分價量表-突破POC追價買進', '分價量表-反彈POC遇壓賣出', '分價量表-破位停損賣出'}
+# 2026-10-05 美股三年三段回測稽核：下列條件單獨無效（或只在單一行情有效），且幾乎不出現在三段都穩定的選股／飆股組合，
+# 不再放進搜尋以減少雜訊與運算量（指定組合比對、追蹤統計、單一條件表仍保留）
+SEARCH_EXCLUDE_FLAGS |= {'跌深反彈盤', '頭肩底剛形成', '複式頭肩底剛形成', '一字底(均線糾結)剛形成', '三重底剛形成', '圓弧底剛形成', '地量(≤0.5倍均量)', '量能區間低檔(≤10百分位)', '突破飆股大量黑K最高點剛形成', 'K線橫盤的突破剛形成', '突破ABC修正下降切線剛形成', 'N字底剛形成'}
 
 
 def search_flags(df):
@@ -1311,6 +1333,7 @@ def build_condition_flags(df: pd.DataFrame):
     if has('relStrength20'):
         F['相對強弱為正(強於大盤)'] = df['relStrength20'].gt(0)
         F['相對強弱為負(弱於大盤)'] = df['relStrength20'].lt(0)
+        F['近20日強於大盤≥10%'] = df['relStrength20'].ge(10)
     if has('volRatio'):
         F['爆量(≥1.5倍均量)'] = df['volRatio'].ge(1.5)
         F['爆量(≥2倍均量)'] = df['volRatio'].ge(2)
@@ -2150,16 +2173,51 @@ def merge_realtime_quote(rows, q):
                         volume=vol if math.isfinite(vol) else 0)], True
 
 
+UNIVERSE_MIN_PRICE = 10.0        # 全美股股票池：股價 ≥10 美元
+UNIVERSE_MIN_DOLLAR_VOL = 1e7     # 成交金額（股價×成交量）≥1000 萬美元
+UNIVERSE_MAX = 2000               # 依成交金額由大到小取前 2000 檔
+
+
+def filter_universe_rows(rows, min_price=UNIVERSE_MIN_PRICE, min_dv=UNIVERSE_MIN_DOLLAR_VOL, cap=UNIVERSE_MAX):
+    """company-screener 結果 → 排除股價 <10、成交金額 <1000萬美元，依成交金額排序取前 cap 檔"""
+    out = []
+    for r in rows or []:
+        sym = r.get('symbol')
+        if not sym:
+            continue
+        try:
+            px = float(r.get('price') or 0)
+        except Exception:  # noqa
+            px = 0.0
+        try:
+            vol = float(r.get('volume') or 0)
+        except Exception:  # noqa
+            vol = 0.0
+        if px and px < min_price:
+            continue
+        dv = px * vol
+        if px and vol and dv < min_dv:
+            continue
+        out.append((dv, sym, r.get('companyName') or sym))
+    out.sort(key=lambda x: -x[0])
+    return [dict(id=sym, name=nm) for _, sym, nm in out[:cap]]
+
+
 def fetch_market_universe(token):
+    # volumeMoreThan 只是粗篩（高價股成交股數少也可能成交金額很大），真正門檻用 股價×成交量 ≥1000萬美元
     j = fmp_get('/company-screener', dict(exchange='NYSE,NASDAQ', country='US', isEtf='false', isFund='false',
-                                          isActivelyTrading='true', volumeMoreThan=50000, limit=3000), token, timeout=60)
+                                          isActivelyTrading='true', priceMoreThan=int(UNIVERSE_MIN_PRICE),
+                                          volumeMoreThan=5000, limit=6000), token, timeout=60)
     if not isinstance(j, list) or not j:
         raise RuntimeError('company-screener 回傳空清單，請確認 API Key 是否有效')
-    return [dict(id=r['symbol'], name=r.get('companyName') or r['symbol']) for r in j if r.get('symbol')]
+    out = filter_universe_rows(j)
+    if not out:
+        raise RuntimeError('company-screener 篩選後沒有股票（股價≥10、成交金額≥1000萬美元）')
+    return out
 
 
 def fetch_market_snapshot(token, progress=None):
-    """全市場（NYSE+NASDAQ，約3000檔）逐檔查 /quote，平行查詢＋限流；回傳 [{id,name,pct,volume}]"""
+    """全市場（NYSE+NASDAQ，約2000檔）逐檔查 /quote，平行查詢＋限流；回傳 [{id,name,pct,volume}]"""
     uni = fetch_market_universe(token)
     names = {u['id']: u['name'] for u in uni}
     out, done = [], [0]
@@ -2273,10 +2331,60 @@ def divergence_asof_us(rev, pxq, asof):
 # ════════════════════════════════════════════════════════════════════
 #  歷史回測
 # ════════════════════════════════════════════════════════════════════
-def add_derived(df):
+# ── 回測記憶體：每檔結果轉成「欄位→numpy 陣列」，最後逐欄合併（合併完一欄就釋放該欄），
+# 記憶體高峰約只有最終資料的 1 倍，不會像 pd.concat＋排序＋複製那樣疊到 3 倍 ──
+DEAD_BT_COLS = ('crossMa60_3', 'crossMa100_3', 'gcBelow0_3')   # 已確認無效、旗標已移除的欄位，不再存進回測紀錄
+
+
+def frame_arrays(d):
+    return {c: d[c].to_numpy(copy=True) for c in d.columns if c not in DEAD_BT_COLS}
+
+
+def low_mem_concat(frames, sort=True):
+    """frames：list of {欄位: 陣列}；依 evalDate、stockId 排序後組成 DataFrame（數值欄一律 float32）"""
+    frames = [f for f in frames if f and len(next(iter(f.values()))) > 0]
+    if not frames:
+        return pd.DataFrame()
+    cols = []
+    seen = set()
+    for f in frames:
+        for c in f:
+            if c not in seen:
+                seen.add(c)
+                cols.append(c)
+    front = [c for c in ('evalDate', 'stockId', 'name') if c in seen]
+    cols = front + [c for c in cols if c not in front]
+    order = None
+    if sort and 'evalDate' in seen and 'stockId' in seen:
+        ed = np.concatenate([np.asarray(f['evalDate']).astype(str) for f in frames])
+        sid = np.concatenate([np.asarray(f['stockId']).astype(str) for f in frames])
+        order = np.lexsort((sid, ed))
+        del ed, sid
+    lens = [len(next(iter(f.values()))) for f in frames]
+    out = {}
+    for c in cols:
+        parts = []
+        for f, n in zip(frames, lens):
+            v = f.pop(c, None)
+            if v is None:
+                v = np.full(n, np.nan, dtype=np.float32) if c not in front else np.array([''] * n, dtype=object)
+            parts.append(v)
+        arr = np.concatenate(parts)
+        del parts
+        if order is not None:
+            arr = arr[order]
+        if c not in front:
+            arr = pd.to_numeric(pd.Series(arr), errors='coerce').to_numpy(dtype=np.float32)
+        out[c] = arr
+    frames.clear()
+    return pd.DataFrame(out, copy=False)
+
+
+def add_derived(df, inplace=False):
     if df.attrs.get('derived'):
         return df
-    df = df.copy()
+    if not inplace:
+        df = df.copy()
 
     def b01(s, cond):
         return np.where(s.isna(), np.nan, cond.astype(float))
@@ -2298,7 +2406,9 @@ def store_bt_df(df):
     全美股約20萬筆時可省下大半記憶體（Streamlit Cloud 記憶體上限約 1GB，超過會整個 App 當掉）"""
     if df is None or not len(df):
         return df
-    df = add_derived(df)
+    df = add_derived(df, inplace=True)   # 剛跑完／剛載入的資料不再複製一份，省一倍記憶體高峰
+    for c in [c for c in DEAD_BT_COLS if c in df.columns]:
+        del df[c]
     for c in df.columns:
         if c in ('evalDate', 'stockId', 'name'):
             continue
@@ -2345,7 +2455,7 @@ def bt_csv_gz(df):
 
 
 def load_bt_files(files):
-    """一次載入一個或多個回測原始紀錄檔（例如三年分三段各一個），合併後去除重複（同日同檔）"""
+    """一次載入一個或多個回測原始紀錄檔（例如三年分六段各一個），逐檔轉成欄位陣列後低記憶體合併，再去除重複（同日同檔）"""
     parts = []
     for f in files:
         if hasattr(f, 'seek'):
@@ -2355,21 +2465,27 @@ def load_bt_files(files):
             if c not in ('evalDate', 'stockId', 'name') and (pd.api.types.is_float_dtype(d[c]) or pd.api.types.is_integer_dtype(d[c])):
                 d[c] = d[c].astype(np.float32)
         d['evalDate'] = d['evalDate'].astype(str)
-        parts.append(d)
-    df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        parts.append(frame_arrays(d))
+        del d
+        __import__("gc").collect()
+    df = low_mem_concat(parts, sort=len(parts) > 1)
     del parts
-    if len(files) > 1:
-        df = df.drop_duplicates(['evalDate', 'stockId'], keep='last').sort_values(['evalDate', 'stockId']).reset_index(drop=True)
+    if len(files) > 1 and len(df):
+        dup = df.duplicated(['evalDate', 'stockId'], keep='last')   # 段與段交界同一天可能重複
+        if dup.any():
+            df = df[~dup.to_numpy()].reset_index(drop=True)
+        del dup
     return store_bt_df(df)
 
 
-BT_SEG_OPTIONS = ['自訂月數', '三年分三段・第1段（最近1年）', '三年分三段・第2段（1～2年前）', '三年分三段・第3段（2～3年前）']
+BT_SEG_MONTHS = 6   # 三年分六段：每段半年（全美股一年一段容易超過 Streamlit Cloud 記憶體）
+BT_SEG_OPTIONS = ['自訂月數'] + [f'三年分六段・第{i + 1}段（{i * 6}～{i * 6 + 6}個月前）' for i in range(6)]
 
 WINSOR_OPTIONS = {'截尾 1%／99%（建議）': 0.01, '截尾 0.5%／99.5%': 0.005, '不處理': 0.0}
-ANALYSIS_DEFAULTS = dict(min_px=5.0, wq=0.01)
+ANALYSIS_DEFAULTS = dict(min_px=10.0, wq=0.01)
 
 
-def prep_analysis_df(df, min_px=5.0, wq=0.01):
+def prep_analysis_df(df, min_px=10.0, wq=0.01):
     """全美股資料含大量小型股：先濾掉低價股，再把 5/10/20 日報酬截尾（winsorize），
     避免少數暴漲暴跌（雞蛋水餃股、反向分割資料錯誤）把平均報酬／t值拉歪。
     回傳 (截尾後df, 未截尾df［飆股搜尋用］, {h: (下限, 上限)}, 被濾掉的筆數)"""
@@ -2394,7 +2510,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
                  stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
-    universe 可以是全美股約3000檔（fetch_market_universe），時間主要花在 API：3000檔約需 11～15 分鐘。"""
+    universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
     buf = 60
     maxh = max(HORIZONS)
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
@@ -2521,8 +2637,9 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                 done += 1
                 last_progress = time.time()
                 if d is not None:
-                    frames.append(d)
                     saved += len(d)
+                    frames.append(frame_arrays(d))
+                    del d
                 else:
                     fail(err)
                 if on_progress:
@@ -2563,13 +2680,11 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
         fut_sid = pending = None                         # 釋放 future 持有的結果，避免和 frames 重複佔記憶體
     if on_progress:
         on_progress(total, total, saved, failed, None, '')
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    frames.clear()
+    df = low_mem_concat(frames)   # 已依 evalDate、stockId 排序
     import gc
     gc.collect()
     if len(df):
         df['evalDate'] = df['evalDate'].astype(str)
-        df = df.sort_values(['evalDate', 'stockId']).reset_index(drop=True)
     top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:5]
     return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg,
                     top_fail=[f'{m}（{c}次）' for m, c in top])
@@ -3358,7 +3473,7 @@ DAILY_USAGE = """每日追蹤（命令列）：
                                         [--token XXX] [--days 180] [--no-extras] [--out 資料夾]
   token 也可用環境變數 FMP_API_KEY。流程：抓清單 → 批次分析 → 命中組合累加到 combo_hits_log_us.csv
   → 更新所有追蹤股票的報酬 → 輸出「美股命中組合_日期.xlsx」（今日命中／追蹤明細／組合彙總）。
-  top100＝全市場約3000檔逐檔查報價後取漲幅前100＋成交量前100（限流280次/分，約需10多分鐘）。
+  top100＝全市場約2000檔逐檔查報價後取漲幅前100＋成交量前100（限流280次/分，約需7～10分鐘）。
   建議排程在美股收盤後（台灣時間早上 6:00 之後）執行。"""
 
 
@@ -3468,7 +3583,7 @@ def main():
             src = ss['lists'].get(k, [])
         ss['stocks_text'] = '\n'.join(src)
 
-    # ── 漲幅／成交量前100（全市場約3000檔逐檔查報價）：在畫出輸入框前先把清單換掉 ──
+    # ── 漲幅／成交量前100（全市場約2000檔逐檔查報價）：在畫出輸入框前先把清單換掉 ──
     pending = ss.pop('pending_top100', None)
     if pending:
         tok = ss.get('token', '').strip()
@@ -3524,10 +3639,10 @@ def main():
         st.checkbox('📌 批次分析後自動把命中組合股票加入追蹤', value=True, key='auto_track')
         run_batch = st.button('🔍 批次分析', type='primary', use_container_width=True, key='run_batch')
         cg, cv = st.columns(2)
-        if cg.button('🔥 漲幅前100', use_container_width=True, help='全市場約3000檔逐檔查報價，約需10多分鐘'):
+        if cg.button('🔥 漲幅前100', use_container_width=True, help='全市場約2000檔逐檔查報價，約需7～10分鐘'):
             ss['pending_top100'] = 'gain'
             st.rerun()
-        if cv.button('📊 成交量前100', use_container_width=True, help='全市場約3000檔逐檔查報價，約需10多分鐘'):
+        if cv.button('📊 成交量前100', use_container_width=True, help='全市場約2000檔逐檔查報價，約需7～10分鐘'):
             ss['pending_top100'] = 'vol'
             st.rerun()
         if ss['msg']:
@@ -3545,31 +3660,31 @@ def main():
             st.caption('⚠️ 美股回測中分價量表訊號單獨都沒有超額報酬，僅供參考，不當組合搜尋條件。')
 
         st.divider()
-        st.markdown('**🔬 歷史回測分析（美股，預設全美股約3000檔）**')
-        bt_univ = st.selectbox('回測股票池', ['全美股（約3000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
-                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，日均量>5萬股），約3000檔')
+        st.markdown('**🔬 歷史回測分析（美股，預設全美股約2000檔）**')
+        bt_univ = st.selectbox('回測股票池', ['全美股（約2000檔）', 'S&P 500', 'Nasdaq-100', 'SOX半導體', '目前輸入框清單'],
+                               key='bt_univ', help='全美股＝FMP company-screener：NYSE＋NASDAQ 可交易個股（排除ETF／基金，股價≥10美元、成交金額≥1000萬美元，依成交金額取前2000檔）')
         bt_workers = st.number_input('回測平行抓取數', 1, 32, 8, 1, key='bt_workers', help='同時抓幾檔；總請求數仍受每分鐘上限控制')
         bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
-                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分三次：每次跑一年，各自下載原始紀錄檔，最後三個檔一起載入合併分析')
+                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分六次：每次跑半年，各自下載原始紀錄檔，最後六個檔一起載入合併分析')
         if bt_seg == BT_SEG_OPTIONS[0]:
             bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
             bt_off = 0
         else:
-            bt_months, bt_off = 12, (BT_SEG_OPTIONS.index(bt_seg) - 1) * 12
-            st.caption(f'本次評估區間：{bt_off}～{bt_off + 12} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
-                       '三段都下載後，三個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋會自動逐段（第1／2／3段）驗證。')
+            bt_months, bt_off = BT_SEG_MONTHS, (BT_SEG_OPTIONS.index(bt_seg) - 1) * BT_SEG_MONTHS
+            st.caption(f'本次評估區間：{bt_off}～{bt_off + BT_SEG_MONTHS} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
+                       '六段都下載後，六個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋仍依評估日切成三段（每年一段）驗證。')
         bt_div = st.checkbox('📈 近1季YoY乖離度（股價歷史要抓超過1年，明顯拉長時間）', key='bt_div')
         bt_sector = st.checkbox('🏭 類股狀態濾網（每檔多一次 sector 查詢）', key='bt_sector')
         bt_earn = st.checkbox('📊 財報驚喜／財報跳空（每檔多一次 earnings 查詢）', True, key='bt_earn',
                               help='美股最穩定的異常之一：財報 EPS 優於預期、財報日向上跳空的股票，之後1～3個月常持續走強（PEAD）')
-        bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 5.0, 1.0, key='bt_minpx',
+        bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
-        bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 500, 100, key='bt_liq',
-                                 help='全美股建議 500 萬美元以上，排除成交清淡的小型股')
+        bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
+                                 help='全美股預設 1000 萬美元：近20日平均成交金額低於此值的評估點不收')
         bt_delay = st.number_input('回測每檔間隔秒數（已有限流器）', 0.0, 5.0, 0.0, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
         st.caption('營收YoY用季報，公告延遲以季末+45天估計（非精確申報日）；美股沒有三大法人資料。')
-        ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如三段各一個）',
+        ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如六段各一個）',
                                type=['csv', 'gz'], accept_multiple_files=True)
         up_sig = tuple(sorted((u.name, u.size) for u in ups)) if ups else None
         if up_sig and ss.get('bt_loaded_name') != up_sig:
