@@ -1212,7 +1212,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
         row.update(mid_momentum(b, e, bm))
         row.update(risk_feats(b, e, bm))
     row['secMom'] = sector_mom(sb, bm, b.date[e])
-    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS:
+    for k in ('epsSurprise', 'earnDays', 'earnGap20', 'earnNext') + PT_KEYS + EV_KEYS + FQ_KEYS:
         if k in ex:
             row[k] = ex[k]
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -1388,6 +1388,29 @@ def build_condition_flags(df: pd.DataFrame):
         F['近1季營收低於預期'] = rsp.lt(0) & red
         if has('epsSurprise'):
             F['近1季EPS與營收雙優於預期'] = df['epsSurprise'].gt(0) & rsp.gt(0) & red
+    # 2026-11-02 新增：財報品質＋P/E 位階（待回測驗證）
+    if has('pePct'):
+        F['P/E近3年低檔(≤20%)'] = df['pePct'].le(20)
+        F['P/E近3年高檔(≥80%)'] = df['pePct'].ge(80)
+    if has('pe'):
+        F['P/E<15倍'] = df['pe'].gt(0) & df['pe'].lt(15)
+        F['P/E≥40倍'] = df['pe'].ge(40)
+    if has('peLoss'):
+        F['近四季虧損(EPS合計≤0)'] = df['peLoss'].eq(1)
+    if has('roe'):
+        F['ROE≥20%(近四季)'] = df['roe'].ge(20)
+        F['ROE<5%(近四季)'] = df['roe'].lt(5)
+    if has('gmYoY'):
+        F['毛利率年增≥2pp(最新季)'] = df['gmYoY'].ge(2)
+        F['毛利率年減≥2pp(最新季)'] = df['gmYoY'].le(-2)
+    if has('gmUp2'):
+        F['毛利率連2季年增'] = df['gmUp2'].eq(1)
+    if has('fcfYld'):
+        F['自由現金流殖利率≥5%'] = df['fcfYld'].ge(5)
+        F['自由現金流為負(近四季)'] = df['fcfYld'].lt(0)
+    if has('accr'):
+        F['應計比率高(盈餘品質差，≥5%)'] = df['accr'].ge(5)
+        F['應計比率低(現金流>盈餘，≤-5%)'] = df['accr'].le(-5)
     if has('shsChg1y'):
         F['流通股數近一年減少≥2%(庫藏股)'] = df['shsChg1y'].le(-2)
         F['流通股數近一年增加≥5%(稀釋)'] = df['shsChg1y'].ge(5)
@@ -2153,6 +2176,116 @@ def shares_feats(ds, hist, inclusive=False):
     return {'shsChg1y': chg if abs(chg) <= 40 else None}   # 超過±40%多半是分割／反分割（股數沒還原），不算
 
 
+# ── 2026-11-02 美股新增：財報品質＋P/E 位階（季報 income／balance／cash-flow，都用 filingDate「當時已公布」）──
+FQ_KEYS = ('pe', 'pePct', 'peLoss', 'roe', 'gmYoY', 'gmUp2', 'fcfYld', 'accr')
+
+
+def _fq_num(r, *ks):
+    for k in ks:
+        try:
+            v = float(r.get(k))
+            if math.isfinite(v):
+                return v
+        except Exception:  # noqa
+            pass
+    return None
+
+
+def fetch_fin_hist(sid, token, limit=24):
+    """三張季報合併 → 依期末日排序的 [{av 可得日, d 期末日, eps, ni, rev, gp, sh, eq, ta, ocf, capex}]；每檔 3 次查詢"""
+    sym = to_fmp_symbol(sid)
+    inc = fmp_get('/income-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    bal = fmp_get('/balance-sheet-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    cf = fmp_get('/cash-flow-statement', dict(symbol=sym, period='quarter', limit=limit), token)
+    q = {}
+    for src, fn in ((inc, lambda r: dict(eps=_fq_num(r, 'epsDiluted', 'epsdiluted', 'eps'), ni=_fq_num(r, 'netIncome'),
+                                          rev=_fq_num(r, 'revenue'), gp=_fq_num(r, 'grossProfit'),
+                                          sh=_fq_num(r, 'weightedAverageShsOutDil', 'weightedAverageShsOut'))),
+                    (bal, lambda r: dict(eq=_fq_num(r, 'totalStockholdersEquity', 'totalEquity'), ta=_fq_num(r, 'totalAssets'))),
+                    (cf, lambda r: dict(ocf=_fq_num(r, 'operatingCashFlow', 'netCashProvidedByOperatingActivities'),
+                                        capex=_fq_num(r, 'capitalExpenditure')))):
+        for r in src if isinstance(src, list) else []:
+            d = str(r.get('date') or '')[:10]
+            if len(d) < 10:
+                continue
+            fd = str(r.get('filingDate') or r.get('acceptedDate') or '')[:10]
+            av = fd if len(fd) == 10 else _ds(dt.date.fromisoformat(d) + dt.timedelta(days=45))
+            x = q.setdefault(d, dict(d=d, av=av))
+            x['av'] = max(x['av'], av)
+            x.update({k: v for k, v in fn(r).items() if v is not None})
+    return sorted(q.values(), key=lambda x: x['d'])
+
+
+def _ttm(qs, k):
+    v = [x.get(k) for x in qs[-4:]]
+    return sum(v) if len(v) == 4 and all(a is not None for a in v) else None
+
+
+def fin_feats_series(b, hist, inclusive=False):
+    """每根K棒「當時已公布」的近四季：回傳 (pe 陣列, 取特徵的函式 f(e))；P/E＝收盤 ÷ 近四季 EPS 合計"""
+    n = b.n
+    hist = sorted(hist or [], key=lambda x: x['av'])
+    pe = [None] * n
+    known_at = [None] * n
+    j, known, ks, eps = 0, [], None, None
+    for e in range(n):
+        ds = b.date[e]
+        grew = False
+        while j < len(hist) and (hist[j]['av'] <= ds if inclusive else hist[j]['av'] < ds):
+            known.append(hist[j])
+            j += 1
+            grew = True
+        if grew:   # 有新季報才重算（同一份清單給之後每根K棒共用）
+            ks = sorted(known, key=lambda x: x['d'])
+            eps = _ttm(ks, 'eps')
+        if ks:
+            known_at[e] = ks
+            if eps is not None and eps > 0 and b.close[e]:
+                pe[e] = b.close[e] / eps
+    def f(e):
+        out = dict.fromkeys(FQ_KEYS)
+        ks = known_at[e]
+        if not ks:
+            return out
+        eps = _ttm(ks, 'eps')
+        if eps is not None:
+            out['peLoss'] = int(eps <= 0)
+            out['pe'] = pe[e]
+        if pe[e] is not None:
+            win = [v for v in pe[max(0, e - 750):e + 1] if v is not None]
+            if len(win) >= 250:
+                out['pePct'] = sum(1 for v in win if v <= pe[e]) / len(win) * 100
+        ni, ocf, cap = _ttm(ks, 'ni'), _ttm(ks, 'ocf'), _ttm(ks, 'capex')
+        last = ks[-1]
+        eq, ta, sh = last.get('eq'), last.get('ta'), last.get('sh')
+        if ni is not None and eq and eq > 0:
+            out['roe'] = ni / eq * 100
+        if ocf is not None and cap is not None and sh and b.close[e]:
+            out['fcfYld'] = (ocf - abs(cap)) / (sh * b.close[e]) * 100
+        if ni is not None and ocf is not None and ta and ta > 0:
+            out['accr'] = (ni - ocf) / ta * 100
+
+        def gm(x):
+            return x['gp'] / x['rev'] * 100 if x.get('gp') is not None and x.get('rev') else None
+
+        def yoy(i):   # 第 i 季（-1＝最新）毛利率比一年前同季（期末日差 300～430 天）
+            if len(ks) < -i:
+                return None
+            cur = ks[i]
+            d1 = dt.date.fromisoformat(cur['d'])
+            old = [x for x in ks if 300 <= (d1 - dt.date.fromisoformat(x['d'])).days <= 430]
+            if not old or gm(cur) is None:
+                return None
+            o = min(old, key=lambda x: abs((d1 - dt.date.fromisoformat(x['d'])).days - 365))
+            return gm(cur) - gm(o) if gm(o) is not None else None
+        g1, g2 = yoy(-1), yoy(-2)
+        out['gmYoY'] = g1
+        if g1 is not None and g2 is not None:
+            out['gmUp2'] = int(g1 > 0 and g2 > 0)
+        return out
+    return pe, f
+
+
 def fetch_grades_hist(sid, token):
     """/grades 評等異動 → [{date, firm, act}]；act：+1 升評、-1 降評、0 維持／新增"""
     j = fmp_get('/grades', dict(symbol=to_fmp_symbol(sid), limit=1000), token)
@@ -2877,15 +3010,55 @@ def prep_analysis_df(df, min_px=10.0, wq=0.01):
     return df, raw, cuts, n0 - len(raw)
 
 
+EXIT_KEYS = ('mdd20', 'mfu20', 'ret60d', 'xStop8', 'xTp20', 'xSt8Tp20', 'xTrail10')
+
+
+def exit_feats(b, e):
+    """2026-11-03 出場規則回測：進場（評估日收盤）後的路徑。全部是 % 報酬：
+    mdd20／mfu20＝20日內最低價／最高價相對進場價；ret60d＝持有60日；
+    xStop8＝20日內跌破 −8% 就停損（以 −8% 計），否則抱滿20日；xTp20＝20日內漲到 +20% 就停利，否則抱滿20日；
+    xSt8Tp20＝兩者都設（同一天都碰到時保守當作先停損）；xTrail10＝收盤自進場後最高收盤回落10%就出場，否則抱滿20日"""
+    out = dict.fromkeys(EXIT_KEYS)
+    ec = b.close[e]
+    if not ec or e + 20 >= b.n:
+        return out
+    lo = [b.low[j] / ec - 1 for j in range(e + 1, e + 21)]
+    hi = [b.high[j] / ec - 1 for j in range(e + 1, e + 21)]
+    r20 = b.close[e + 20] / ec - 1
+    out['mdd20'], out['mfu20'] = min(lo) * 100, max(hi) * 100
+    if e + 60 < b.n:
+        out['ret60d'] = (b.close[e + 60] / ec - 1) * 100
+    ds = next((k for k, v in enumerate(lo) if v <= -0.08), None)
+    dt_ = next((k for k, v in enumerate(hi) if v >= 0.20), None)
+    out['xStop8'] = -8.0 if ds is not None else r20 * 100
+    out['xTp20'] = 20.0 if dt_ is not None else r20 * 100
+    if ds is None and dt_ is None:
+        out['xSt8Tp20'] = r20 * 100
+    elif dt_ is None or (ds is not None and ds <= dt_):
+        out['xSt8Tp20'] = -8.0
+    else:
+        out['xSt8Tp20'] = 20.0
+    pk, x = ec, None
+    for j in range(e + 1, e + 21):
+        c = b.close[j]
+        pk = max(pk, c)
+        if c <= pk * 0.9:
+            x = c / ec - 1
+            break
+    out['xTrail10'] = (x if x is not None else r20) * 100
+    return out
+
+
 def run_backtest(token, universe, months_back, include_div, include_sector, min_liq, vp_params,
                  delay=0.0, on_progress=None, should_stop=None, names=None, workers=8, min_px=0.0,
-                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False):
+                 stock_timeout=150, stall_timeout=300, end_offset_months=0, include_earn=True, include_pt=False, include_ev=False,
+                 include_fq=False):
     """回測：多執行緒平行抓資料（所有請求共用限流器），每檔算完就轉成 DataFrame 以節省記憶體。
     universe 可以是全美股約2000檔（fetch_market_universe），時間主要花在 API：2000檔約需 8～10 分鐘。"""
     buf = 60
     maxh = max(HORIZONS)
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
-    price_days = (months_back + off) * 30 + buf + maxh + 10 + 400   # +400天：52週高點、布林收窄需要約一年歷史（營收乖離也夠用）
+    price_days = (months_back + off) * 30 + buf + maxh + 10 + (1100 if include_fq else 400)   # +400天：52週高點、布林收窄需要約一年歷史；P/E 近3年位階要 +1100 天
     q_back = math.ceil((months_back + off) / 3) + 5
     bm_err = None
     try:
@@ -2899,6 +3072,7 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     total = len(universe)
     vx = locals().get('vx')
     ev_state = {k: {'ok': 0, 'fail': 0, 'err': None, 'off': False} for k in ('shares', 'grades', 'insider')}
+    fq_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 財報品質／P/E：前20檔全部失敗（方案不支援季報）就停止抓
     pt_state = {'ok': 0, 'fail': 0, 'err': None, 'off': False}   # 前20檔目標價全部失敗（方案不支援）→ 之後不再抓，省API
     pt_lock = threading.Lock()
 
@@ -2965,6 +3139,18 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                             stt_['err'] = str(ex_)[:150]
                             if stt_['ok'] == 0 and stt_['fail'] >= 20:
                                 stt_['off'] = True
+            fqf = None
+            if include_fq and not fq_state['off']:
+                try:
+                    _, fqf = fin_feats_series(b, fetch_fin_hist(sid, token, limit=math.ceil((months_back + off) / 3) + 20))
+                    with pt_lock:
+                        fq_state['ok'] += 1
+                except Exception as ex_:  # noqa
+                    with pt_lock:
+                        fq_state['fail'] += 1
+                        fq_state['err'] = str(ex_)[:150]
+                        if fq_state['ok'] == 0 and fq_state['fail'] >= 20:
+                            fq_state['off'] = True
             pc = PatternCache(b)
             recs = []
             for e in range(buf, ev_end):
@@ -2993,11 +3179,14 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
                     ex.update(insider_feats(ds, evh['insider']))
                 if vx:
                     ex['vix'] = vix_asof(vx, ds)
+                if fqf:
+                    ex.update(fqf(e))
                 row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
                 ec = b.close[e]
                 row['entryClose'] = ec
                 for h in HORIZONS:
                     row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
+                row.update(exit_feats(b, e))
                 recs.append(row)
             if not recs:
                 return None, f'資料抓到了（{n}筆，最新到{b.date[-1]}），但沒有任何一天落在回測天數／流動性門檻範圍內'
@@ -3107,9 +3296,11 @@ def run_backtest(token, universe, months_back, include_div, include_sector, min_
     ev_err = '；'.join(f"{dict(shares='流通股數', grades='評等升降', insider='內部人交易')[k]} {v['fail']} 檔抓取失敗"
                        + ('（前20檔全部失敗已停止）' if v['off'] else '') + f"：{v['err']}"
                        for k, v in ev_state.items() if include_ev and v['fail']) or None
+    fq_err = (f"財報品質／P/E（季報三張表）{fq_state['fail']} 檔抓取失敗" + ('，前20檔全部失敗已停止抓取' if fq_state['off'] else '')
+              + f"：{fq_state['err']}") if include_fq and fq_state['fail'] else None
     pt_err = (f"目標價（price-target-news）{pt_state['fail']} 檔抓取失敗" + ('，前20檔全部失敗已停止抓取' if pt_state['off'] else '')
               + f"：{pt_state['err']}") if include_pt and pt_state['fail'] else None
-    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err, ev_err=ev_err,
+    return df, dict(saved=saved, failed=failed, total=total, bm_err=bm_err, stopped=stopped_msg, pt_err=pt_err, ev_err=ev_err, fq_err=fq_err,
                     vix_err=None if vx else 'VIX（^VIX）抓不到，VIX 條件這次不會出現',
                     top_fail=[f'{m}（{c}次）' for m, c in top])
 
@@ -3391,15 +3582,173 @@ def market_position(mt, kp):
     return pct, act, sc, '、'.join(parts)
 
 
+# ── 2026-11-03 美股過熱／反彈訊號燈：用大盤預測評分卡的即時讀數（數值＋歷史百分位），各四盞燈，不另外打 API ──
+#    美股沒有融資／法人資料，改用 VIX、信用利差（HYG/IEF）、SPY 乖離與漲幅
+def _hp(g, nm, d):
+    v = g(nm, 'p')
+    return d if v is None else v
+
+
+def _hv(g, nm, d):
+    v = g(nm)
+    return d if v is None else v
+
+
+HEAT_RULES = (
+    ('過熱', '價格乖離', lambda g: _hp(g, '偏離200日均線%', 0) >= 90 or _hv(g, 'RSI14', 0) > 75, 'SPY 偏離200日均線在歷史前10%或 RSI>75'),
+    ('過熱', '漲幅過快', lambda g: _hp(g, '近20日漲幅%', 0) >= 90, 'SPY 近20日漲幅在歷史前10%'),
+    ('過熱', '情緒樂觀', lambda g: _hp(g, 'VIX', 100) <= 10 or _hv(g, 'VIX', 99) < 13, 'VIX 在歷史最低10%或低於13（沒人避險）'),
+    ('過熱', '信用狂熱', lambda g: _hp(g, 'HYG/IEF近60日%', 0) >= 90, '垃圾債相對公債近60日漲幅在歷史前10%（追逐風險）'),
+    ('反彈', '價格超跌', lambda g: _hv(g, '距一年高點%', 0) <= -15 or _hv(g, 'RSI14', 50) < 30, 'SPY 距一年高點跌≥15% 或 RSI<30'),
+    ('反彈', '恐慌極端', lambda g: _hv(g, 'VIX', 0) >= 30 or _hp(g, 'VIX', 0) >= 90, 'VIX≥30 或在歷史最高10%'),
+    ('反彈', '恐慌消退', lambda g: _hp(g, 'VIX', 0) >= 60 and _hp(g, 'VIX近20日變化', 100) <= 15, 'VIX 仍偏高但近20日明顯回落（恐慌高點已過）'),
+    ('反彈', '信用壓力', lambda g: _hp(g, 'HYG/IEF近60日%', 100) <= 10, '垃圾債相對公債近60日跌幅在歷史最差10%（信用恐慌）'),
+)
+
+
+def heat_lights(pred):
+    if not pred or pred.get('err') or not pred.get('det'):
+        return None
+    D = {d['name']: d for d in pred['det']}
+
+    def g(nm, k='v'):
+        d = D.get(nm)
+        if not d:
+            return None
+        return d.get('pct') if k == 'p' else d.get('val')
+    out = []
+    for kind, nm, fn, why in HEAT_RULES:
+        try:
+            on = bool(fn(g))
+        except Exception:  # noqa
+            on = False
+        out.append((kind, nm, on, why))
+    return sum(1 for x in out if x[0] == '過熱' and x[2]), sum(1 for x in out if x[0] == '反彈' and x[2]), out
+
+
+def heat_light_lines(pred):
+    h = heat_lights(pred)
+    if not h:
+        return ['・🚦 過熱／反彈訊號燈：需要先在「🔮 大盤預測」建立評分卡（訊號燈用評分卡的即時讀數，不另外打 API）']
+    nh, nr, L = h
+    lamp = lambda kind, on: ('🔴' if kind == '過熱' else '🟢') if on else '⚪'
+    hot = '　'.join(f'{lamp(k, on)}{nm}' for k, nm, on, _ in L if k == '過熱')
+    reb = '　'.join(f'{lamp(k, on)}{nm}' for k, nm, on, _ in L if k == '反彈')
+    if nr >= 3:
+        verdict = '反彈條件多數成形：恐慌已到極端或開始消退，可分批佈局，等指數站回5日線確認'
+    elif nr >= 2:
+        verdict = '反彈條件開始出現：歷史上之後報酬較好但震盪大，可分批加碼'
+    elif nh >= 2:
+        verdict = '過熱燈亮但美股回測顯示之後反而較平穩（過熱燈僅供參考）'
+    else:
+        verdict = '沒有明顯過熱或反彈訊號：依建議持股正常操作'
+    on = [(nm, why) for _, nm, o, why in L if o]
+    return [f"・🚦 **過熱訊號燈 {nh}/4**（僅供參考：2026-11-04 回測亮燈後跌幅反而較小）：{hot}", f"・🚦 **反彈訊號燈 {nr}/4**：{reb}",
+            f"・訊號燈判讀：{verdict}" + ('（亮燈條件：' + '；'.join(f'{nm}＝{why}' for nm, why in on) + '）' if on else '')]
+
+
+def heat_adjust(pos, pred):
+    """2026-11-04 美股訊號燈門檻回測：過熱燈亮時之後反而更平穩（VIX低、信用寬鬆＝續漲）→ 不再減碼；
+    反彈燈亮時之後20日平均多 +0.4～+1.9%（但震盪大）→ 每亮一盞 +10%"""
+    h = heat_lights(pred)
+    if pos is None or not h:
+        return pos, ''
+    nh, nr, _ = h
+    if not nr:
+        return pos, ''
+    adj = max(0, min(100, pos + 10 * nr))
+    return int(round(adj / 5) * 5), f'反彈訊號燈 {nr} 盞 +{10 * nr}%（過熱燈僅供參考，回測無預警效果）'
+
+
+
+def heat_backtest(cols, raw, X, r, dd):
+    """2026-11-04 訊號燈門檻回測：每天用「當時為止」的歷史百分位（不偷看未來）判斷各盞燈，看之後20日大盤報酬與期間最大跌幅。
+    回傳 {base, lights:[...], hot:[...], reb:[...], combo:[...]}；沒有足夠資料回 None"""
+    n = len(r)
+    ok_idx = [i for i in range(n) if np.isfinite(r[i]) and np.isfinite(X[i]).sum() >= max(3, len(cols) // 2)]
+    if len(ok_idx) < 250:
+        return None
+    nh_a, nr_a, on_a = [], [], []
+    for i in ok_idx:
+        det = [dict(name=nm, val=(float(raw[i, j]) if np.isfinite(raw[i, j]) else None),
+                    pct=(round(float(X[i, j]) * 100) if np.isfinite(X[i, j]) else None)) for j, nm in enumerate(cols)]
+        h = heat_lights(dict(det=det))
+        nh_a.append(h[0]); nr_a.append(h[1]); on_a.append([x[2] for x in h[2]])
+    rr, d5 = np.array([r[i] for i in ok_idx]), np.array([dd[i] for i in ok_idx])
+    ex = {h: (np.array([_MP_EXT[h][i] for i in ok_idx]) if _MP_EXT.get(h) is not None else None) for h in MP_EXT_H}
+
+    def em(a, m):
+        if a is None:
+            return None
+        x = a[m]
+        x = x[np.isfinite(x)]
+        return round(float(x.mean()), 2) if len(x) >= 20 else None
+    nh_a, nr_a, on_a = np.array(nh_a), np.array(nr_a), np.array(on_a, dtype=bool)
+
+    def st_(m, **k):
+        m = np.asarray(m, bool)
+        if m.sum() < 20:
+            return dict(k, n=int(m.sum()), ret=None, up=None, dd5=None, mdd=None)
+        return dict(k, n=int(m.sum()), ret=round(float(rr[m].mean()), 2), up=round(float((rr[m] > 0).mean() * 100), 1),
+                    dd5=round(float((d5[m] <= -5).mean() * 100), 1), mdd=round(float(d5[m].mean()), 2),
+                    **{f'ret{h}': em(ex[h], m) for h in MP_EXT_H})
+    out = dict(start=None, base=st_(np.ones(len(rr), bool), name='全部日子'))
+    out['lights'] = [st_(on_a[:, j], kind=kind, name=nm, why=why) for j, (kind, nm, _, why) in enumerate(HEAT_RULES)]
+    out['hot'] = [st_(nh_a == k if k < 3 else nh_a >= 3, name=f'過熱 {k if k < 3 else "3+"} 盞') for k in range(4)]
+    out['reb'] = [st_(nr_a == k if k < 3 else nr_a >= 3, name=f'反彈 {k if k < 3 else "3+"} 盞') for k in range(4)]
+    out['combo'] = [st_((nh_a >= 3) & (nr_a <= 1), name='過熱≥3且反彈≤1'),
+                    st_((nr_a >= 2) & (nh_a <= 1), name='反彈≥2且過熱≤1'),
+                    st_((nh_a == 0) & (nr_a == 0), name='全部不亮')]
+    return out
+
+
+def heat_backtest_frames(hb):
+    """→ (說明文字, [DataFrame...]) 給 Streamlit 顯示"""
+    b = hb['base']
+    dif = lambda x, k: None if x.get(k) is None or b.get(k) is None else round(x[k] - b[k], 2)
+    rows = lambda L: pd.DataFrame([dict(項目=(x.get('kind', '') + '・' if x.get('kind') else '') + x['name'], 天數=x['n'], 之後20日平均報酬=x['ret'],
+                                        比全部=dif(x, 'ret'), 之後40日平均報酬=x.get('ret40'), 比全部_40日=dif(x, 'ret40'),
+                                        之後60日平均報酬=x.get('ret60'), 比全部_60日=dif(x, 'ret60'), 上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 比全部_跌5=dif(x, 'dd5'), 平均最大跌幅=x['mdd']) for x in L])
+    txt = (f"全部 {b['n']} 天：之後20日平均 {b['ret']}%（40日 {b.get('ret40')}%、60日 {b.get('ret60')}%）、上漲機率 {b['up']}%、期間跌≥5%機率 {b['dd5']}%、平均最大跌幅 {b['mdd']}%。"
+           '過熱燈有效＝亮燈時「跌≥5%機率」明顯高於全部（比全部_跌5 為正）；反彈燈有效＝亮燈時之後報酬高於全部（比全部 為正）。')
+    return txt, [rows(hb['lights']), rows(hb['hot'] + hb['reb']), rows(hb['combo'])]
+
+def market_verdict(mt, kp, pred):
+    """2026-11-04 美股版：過熱燈回測無效，綜合判斷只看價格面＋反彈燈"""
+    h = heat_lights(pred)
+    if not h:
+        return None
+    nh, nr, _ = h
+    tz, kz = (mt or {}).get('zone'), (kp or {}).get('zone')
+    cheap = kz == '超賣' or tz in ('極冷', '偏冷')
+    rich = kz == '過熱' or tz in ('偏熱', '過熱')
+    if cheap and nr >= 2:
+        return '🧭 綜合判斷：**價格超賣＋恐慌到位** → 歷史上之後報酬最好的區間（但震盪大），可分批提高部位'
+    if cheap:
+        return '🧭 綜合判斷：**價格偏低、恐慌未到極端** → 可逢低分批，VIX 急升時再加碼'
+    if nr >= 2:
+        return '🧭 綜合判斷：**價格中性、恐慌訊號多** → 歷史上之後報酬較好，可逐步提高部位，留意震盪'
+    if rich:
+        return '🧭 綜合判斷：**價格偏熱** → 美股回測顯示平穩上漲時常續漲，照常操作、不追高即可'
+    return '🧭 綜合判斷：價格與情緒都沒有極端訊號 → 正常部位'
+
+
 def market_guide_lines(mt, kp, pred=None):
     """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）；
     大盤預測評分卡樣本外驗證有效時，建議持股改用評分卡"""
     out = []
     ps = market_position(mt, kp)
+    _heat = heat_light_lines(pred)
+    _vd = market_verdict(mt, kp, pred)
+    if _vd:
+        out.append(_vd)
     if pred and not pred.get('err') and pred.get('valid') and pred.get('models'):
         out.append(mp_guide_text(pred, ps[0] if ps else None))
         ps = None
     if ps:
+        _adj, _why = heat_adjust(ps[0], pred)
+        if _why and _adj != ps[0]:
+            ps = (_adj, '依訊號燈調整', ps[2], ps[3] + f'；溫度計＋K線原本 {ps[0]}%，{_why}')
         out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
                    + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
     if kp:
@@ -3453,6 +3802,7 @@ def market_guide_lines(mt, kp, pred=None):
         if kp['zone'] != '超賣' and not cold_t:
             w.append('最佳時機＝K線「超賣」且溫度計同時「偏冷／極冷」')
         out.append('・接下來觀察：' + '；'.join(w))
+    out += _heat
     return out
 
 
@@ -3524,7 +3874,8 @@ MP_EMB = 20        # 訓練期最後20天不用
 MP_MIN_IC = 0.03
 MP_MIN_HIST = 250  # 指標至少有 250 天歷史才算百分位
 MP_POS = [30, 40, 50, 65, 80]   # 樣本外五級（最差→最好）對應的建議持股%
-MP_SCHEMES = {'積極（30/40/50/65/80%）': [30, 40, 50, 65, 80], '溫和（50/55/60/65/70%）': [50, 55, 60, 65, 70]}
+MP_SCHEMES = {'積極（30/40/50/65/80%）': [30, 40, 50, 65, 80], '溫和（50/55/60/65/70%）': [50, 55, 60, 65, 70],
+              '逆向（80/65/50/40/30%）': [80, 65, 50, 40, 30]}   # 2026-11-04 逆向：風險越高持股越高（美股風險第1級之後60日 +5.4%）
 MP_VT_NAME = '波動率目標（不靠模型）'
 MP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), MP_FILE_NAME)
 
@@ -3568,6 +3919,27 @@ def mp_targets(c):
         r20[i] = (v[i + 20] / v[i] - 1) * 100
         d20[i] = (v[i + 1:i + 21].min() / v[i] - 1) * 100
     return r20, d20
+
+
+MP_EXT_H = (40, 60)   # 2026-11-04 大盤回測另外列出 40／60 日後報酬（模型仍以 20 日訓練）
+_MP_EXT = {}
+
+
+def mp_ret_h(c, h):
+    v = c.values.astype(float)
+    out = np.full(len(v), np.nan)
+    if len(v) > h:
+        out[:-h] = (v[h:] / v[:-h] - 1) * 100
+    return out
+
+
+def _ext_mean(h, sel):
+    a = _MP_EXT.get(h)
+    if a is None:
+        return None
+    x = a[sel]
+    x = x[np.isfinite(x)]
+    return round(float(x.mean()), 2) if len(x) >= 20 else None
 
 
 def _mp_pct_expanding(x):
@@ -3655,8 +4027,11 @@ def _mp_model(X, y, r, dd, n, idx, kind, fixed=None):
     tbl = []
     for g in range(5):
         mm = q == g
+        _sel = np.zeros(len(ok), bool)
+        _sel[np.where(ok)[0][mm]] = True
         tbl.append(dict(n=int(mm.sum()), ret=round(float(rr[mm].mean()), 2), up=round(float((rr[mm] > 0).mean() * 100), 1),
-                        dd5=round(float((d[mm] <= -5).mean() * 100), 1), mdd=round(float(d[mm].mean()), 2)))
+                        dd5=round(float((d[mm] <= -5).mean() * 100), 1), mdd=round(float(d[mm].mean()), 2),
+                        **{f'ret{h}': _ext_mean(h, _sel) for h in MP_EXT_H}))
     key = 'ret' if kind == 'ret' else 'mdd'      # 報酬模型看平均報酬、風險模型看平均最大跌幅，都要由差到好
     m['mono'] = round(_mp_spear(np.arange(5, dtype=float), np.array([x[key] for x in tbl]), 3), 2)
     m['quint'], m['edges'] = tbl, edges
@@ -3684,6 +4059,8 @@ def mp_walkforward(F, c, market):
     pri = np.array([float(MP_RISK_PRIOR.get(c_, 0)) for c_ in cols])
     rep['models'], qw = {}, {}
     for kd, _, _ in MP_MODELS:
+        _MP_EXT.clear()
+        _MP_EXT.update({h: mp_ret_h(c, h) for h in MP_EXT_H})
         rep['models'][kd], qw[kd] = _mp_model(X, (r if kd == 'ret' else dd), r, dd, n, F.index, kd, fixed=(pri if kd == 'risk' and pri.any() else None))
     mr = rep['models']['ret']
     rep['n_oos'] = mr['n_oos']
@@ -3694,11 +4071,16 @@ def mp_walkforward(F, c, market):
     rep['oos_start'] = mr['oos_start']
     rep['base'] = dict(ret=round(float(r[ok].mean()), 2), up=round(float((r[ok] > 0).mean() * 100), 1),
                        dd5=round(float((dd[ok] <= -5).mean() * 100), 1), mdd=round(float(dd[ok].mean()), 2))
+    rep['base'].update({f'ret{h}': _ext_mean(h, ok) for h in MP_EXT_H})
     mp_simulate(rep, F, c, qw)
     rep['valid'] = rep.get('pick') is not None
     rep['ref'] = [[round(float(v), 4) for v in np.sort(raw[:, j][np.isfinite(raw[:, j])])] for j in range(len(cols))]
     rep['w'] = True   # 舊欄位相容：有評分卡
     rep['now'] = mp_reading(rep, {cols[j]: raw[-1, j] for j in range(len(cols))}, str(F.index[-1])[:10])
+    try:   # 2026-11-04 訊號燈門檻回測
+        rep['heat'] = heat_backtest(cols, raw, X, r, dd)
+    except Exception as ex_:  # noqa
+        rep['heat'] = dict(err=str(ex_)[:150])
     return rep
 
 
@@ -3768,6 +4150,19 @@ def _mp_read_model(m, pcts):
     return dict(score=round(s, 3), q=q + 1, ret=qt['ret'], up=qt['up'], dd5=qt['dd5'], mdd=qt['mdd'], valid=m['valid'], oos_ic=m['oos_ic'], top=det[:3])
 
 
+# 2026-11-04 持股策略偏好（美股大盤回測：控制回撤 年化5.7%/回撤−12%；平衡 9.8%/−21%；永遠滿倉 12.1%/−34%）
+MP_PREFS = ['平衡（波動率目標，預設）', '控制回撤（評分卡自動挑選）', '報酬優先（永遠滿倉）']   # 2026-11-04 逆向加碼回測較差（夏普0.66＜滿倉0.75、回撤−27%）已移除，模擬表保留對照
+
+
+def get_mp_pref():
+    try:
+        import streamlit as _st
+        v = _st.session_state.get('mp_pref')
+        return v if v in MP_PREFS else MP_PREFS[0]
+    except Exception:  # noqa
+        return MP_PREFS[0]
+
+
 def mp_reading(sc, vals, asof):
     """用評分卡算「今天」：各指標在完整歷史的百分位 → 報酬模型／風險模型各自第幾級 → 建議持股（有效的模型取平均）"""
     if not sc or not sc.get('models'):
@@ -3780,6 +4175,17 @@ def mp_reading(sc, vals, asof):
         det.append(dict(name=nm, val=None if v is None or not np.isfinite(v) else round(float(v), 2), pct=None if pc is None else round(pc * 100)))
     rd = {kd: _mp_read_model(sc['models'][kd], pcts) for kd, _, _ in MP_MODELS if sc['models'].get(kd)}
     pk, pos = sc.get('pick'), None
+    pref = get_mp_pref()
+    if pref.startswith('報酬優先'):
+        return dict(asof=asof, models=rd, pos=100, valid=True, pick='報酬優先：永遠滿倉（只看個股訊號）', det=det)
+    if pref.startswith('平衡') and sc.get('vt_med'):
+        vn = vals.get('60日波動率%')
+        if vn is not None and np.isfinite(vn) and vn > 0:
+            return dict(asof=asof, models=rd, pos=int(round(min(1.0, max(0.3, sc['vt_med'] / vn)) * 100 / 5) * 5), valid=True,
+                        pick='平衡：' + MP_VT_NAME, det=det)
+    if pref.startswith('逆向') and rd.get('risk') and (sc['models'].get('risk') or {}).get('valid'):
+        _nm = '逆向（80/65/50/40/30%）'
+        return dict(asof=asof, models=rd, pos=MP_SCHEMES[_nm][rd['risk']['q'] - 1], valid=True, pick='逆向加碼：風險模型・' + _nm, det=det)
     if pk and pk.get('kind') == 'model' and rd.get(pk['model']):
         pos = pk['pos'][rd[pk['model']]['q'] - 1]
     elif pk and pk.get('kind') == 'vt' and sc.get('vt_med'):
@@ -3854,6 +4260,10 @@ def render_market_pred(st, ss, K):
                '預測未來20日期間最大跌幅（波動有群聚性，通常比報酬好預測），walk-forward 只用來驗證。'
                '模型樣本外有效（IC≥0.05、五級表現由差到好單調）才可用；再做持股策略模擬（積極／溫和兩種對照表、波動率目標法），'
                '夏普值勝過永遠滿倉且回撤較小的方式才拿來當建議持股，否則維持原本的溫度計＋K線規則。每次批次分析會多抓約' + MP_LIVE_COST + '的大盤資料。')
+    st.radio('持股策略偏好（批次分析的建議持股用這個）', MP_PREFS, key='mp_pref', horizontal=True,
+             help='2026-11-04 美股大盤回測（2009-12 起樣本外）：控制回撤＝評分卡自動挑選（風險模型・積極：年化約5.7%、最大回撤約−12%）；'
+                  '平衡＝波動率目標（年化約9.8%、回撤約−21%、平均持股90%）；報酬優先＝永遠滿倉（年化約12.1%、回撤約−34%）。'
+                  '美股高風險期之後報酬反而最高，減碼主要是減少震盪')
     c1, c2 = st.columns([1, 2])
     yrs = c1.slider('歷史年數', 8, 20, 15, key='mp_years')
     if c2.button('🔮 執行大盤預測回測', type='primary', key='run_mp'):
@@ -3865,8 +4275,12 @@ def render_market_pred(st, ss, K):
                 with st.spinner('抓取大盤歷史資料並做樣本外驗證中…'):
                     rep = mp_build(tok, yrs)
                 ss['mp_rep'] = rep
-                if rep.get('models'):
+                _old = mp_load()
+                if rep.get('models') and (rep.get('valid') or not (_old and _old.get('valid'))):
                     mp_save(rep)
+                elif rep.get('models'):   # 2026-11-03：新評分卡沒通過驗證 → 不覆蓋上一張通過的，批次分析的建議持股才不會大跳
+                    st.warning(f"⚠️ 這次重建的評分卡沒有通過驗證，**批次分析繼續使用上一張通過的評分卡**（{_old.get('built', '')} 建立）。"
+                               '下方顯示的是這次重建的結果，僅供比較；要改用這張，請下載後用下方「載入」上傳。')
             except Exception as ex:  # noqa
                 st.error(f'❌ 大盤預測回測失敗：{ex}')
     up_ = st.file_uploader('或載入先前下載的評分卡（.json；Streamlit Cloud 重新啟動後本機檔案會消失，可用這個還原）', type=['json'], key='mp_up')
@@ -3898,10 +4312,12 @@ def render_market_pred(st, ss, K):
             f"{'✅ 樣本外驗證有效' if m['valid'] else '⚠️ 樣本外驗證未通過'}：IC {m['oos_ic']:+.3f}、五級單調度 {m['mono']:+.2f}"
             + ('（需要 IC≥0.05 且單調度≥0.7）→ 不採用' if not m['valid'] else ' → 可用，持股對照表看下方「持股策略模擬」'))
         st.dataframe(pd.DataFrame([dict(級別=f'第{k + 1}級' + ('（最差）' if k == 0 else '（最好）' if k == 4 else ''), 天數=x['n'],
-                                        未來20日平均報酬=x['ret'], 上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 平均最大跌幅=x['mdd'],
+                                        未來20日平均報酬=x['ret'], 未來40日平均報酬=x.get('ret40'), 未來60日平均報酬=x.get('ret60'),
+                                        上漲機率=x['up'], 期間跌5以上機率=x['dd5'], 平均最大跌幅=x['mdd'],
                                         建議持股=((rep['pick']['pos'][k] if rep.get('pick') and rep['pick'].get('model') == kd else '—') if m['valid'] else '不採用'))
                                    for k, x in enumerate(m['quint'])]
-                                  + [dict(級別='全部（永遠持有）', 天數=rep['n_oos'], 未來20日平均報酬=b['ret'], 上漲機率=b['up'],
+                                  + [dict(級別='全部（永遠持有）', 天數=rep['n_oos'], 未來20日平均報酬=b['ret'], 未來40日平均報酬=b.get('ret40'),
+                                          未來60日平均報酬=b.get('ret60'), 上漲機率=b['up'],
                                           期間跌5以上機率=b['dd5'], 平均最大跌幅=b['mdd'], 建議持股='')]),
                      hide_index=True, use_container_width=True)
     if rep.get('sim'):
@@ -3925,6 +4341,15 @@ def render_market_pred(st, ss, K):
                 o[f'{mn}一致率'] = f"{m['stab'][j]}%（{m['nf'][j]}段）" if m['stab'][j] is not None else '—'
         rows.append(o)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    hb = rep.get('heat')
+    st.markdown('**🚦 訊號燈門檻回測**（每天只用當時為止的歷史百分位判斷亮燈，看之後20日大盤表現）')
+    if hb and not hb.get('err'):
+        _t, _fs = heat_backtest_frames(hb)
+        st.caption(_t)
+        for _f in _fs:
+            st.dataframe(_f, hide_index=True, use_container_width=True)
+    else:
+        st.caption('這張評分卡是舊版建立的，請重新按「🔮 執行大盤預測回測」' + (f"（{hb['err']}）" if hb else ''))
     now = rep.get('now')
     if now:
         st.markdown(mp_panel_line(now))
@@ -3990,6 +4415,20 @@ def top_mark_lines(df, n=None):
     return out
 
 
+PICK_N = 20   # 2026-11-03 本月建議組合檔數
+
+
+def monthly_picks(df, n=None):
+    """2026-11-03 投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）最穩的規則：
+    主力＝命中 S 或 W、排除⚠️（毛利率年減／近20日平淡），依多方力道取前 n 檔；保守＝營運雙優（毛利率年增＋EPS大幅優於預期）依多方力道取前 n 檔"""
+    n = n or PICK_N
+    if df is None or not len(df) or '_sw' not in df.columns:
+        return None, None
+    main = df[df['_sw'] & ~df['_warn']].sort_values('多方力道', ascending=False).head(n)
+    safe = df[df['_dual']].sort_values('多方力道', ascending=False).head(n)
+    return main, safe
+
+
 def summary_frame(results, extras_flags, K, live=None):
     ensure_flagsets(results)
     recs = []
@@ -4048,6 +4487,32 @@ def summary_frame(results, extras_flags, K, live=None):
             rec['流通股數1年%'] = round(rw_['shsChg1y'], 1) if isnum(rw_.get('shsChg1y')) else None
             rec['近30日升/降評'] = f"↑{int(rw_['gUp30'])} ↓{int(rw_['gDn30'])}" if isnum(rw_.get('gUp30')) else '無資料'
             rec['近90日內部人買進'] = (f"{int(rw_['insBuyN90'])}人 ${rw_['insBuyVal90'] / 1e6:.2f}M" if rw_['insBuyN90'] else '0') if isnum(rw_.get('insBuyN90')) else '無資料'
+        if extras_flags.get('fq'):
+            f1 = lambda k, d=1: round(rw_[k], d) if isnum(rw_.get(k)) else None
+            rec['P/E(近四季)'] = f1('pe') if rw_.get('peLoss') != 1 else '虧損'
+            rec['P/E近3年百分位'] = f1('pePct', 0)
+            rec['ROE%'] = f1('roe')
+            rec['毛利率年增pp'] = f1('gmYoY')
+            rec['FCF殖利率%'] = f1('fcfYld')
+            rec['應計比率%'] = f1('accr')
+            # 2026-11-03 兩批股票交叉驗證：單獨「毛利率年增」在新股票上最近一年失效 → 不打勾；
+            # 「毛利率年增＋EPS大幅優於預期」兩批都成立（+0.66%／新股票 +0.52%）；S選股型＋毛利率年增 超額約多 1%；
+            # 毛利率年減、EPS優於但毛利率年減 兩批都跑輸 → 警示；虧損／FCF為負／低ROE 飆股率2～3倍但跌>10%約兩成
+            fs = []
+            gy = rw_.get('gmYoY') if isnum(rw_.get('gmYoY')) else None
+            es_ok = isnum(rw_.get('epsSurprise')) and isnum(rw_.get('earnDays')) and rw_['earnDays'] <= 63
+            es = rw_['epsSurprise'] if es_ok else None
+            if gy is not None and gy >= 2 and es is not None and es >= 10:
+                fs.append('✅✅營運雙優')
+            if gy is not None and gy >= 2 and ms:
+                fs.append('⭐S＋毛利率年增')
+            if gy is not None and gy <= -2:
+                fs.append('⚠️EPS優於但毛利率年減' if (es is not None and es > 0) else '⚠️毛利率年減')
+            if rw_.get('peLoss') == 1 or (isnum(rw_.get('fcfYld')) and rw_['fcfYld'] < 0) or (isnum(rw_.get('roe')) and rw_['roe'] < 5):
+                fs.append('🎲' + ('虧損' if rw_.get('peLoss') == 1 else 'FCF為負' if (isnum(rw_.get('fcfYld')) and rw_['fcfYld'] < 0) else '低ROE'))
+            rec['財報訊號'] = ' '.join(fs)
+            if not any(isnum(rw_.get(k)) for k in ('pe', 'roe', 'gmYoY', 'fcfYld')) and r.get('fqErr'):
+                rec['ROE%'] = '⚠️ 讀取失敗'
         if extras_flags.get('pt'):
             pi = r.get('ptInfo') or {}
             up = pi.get('ptUpside')
@@ -4099,6 +4564,13 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['回測高勝率命中'] = _short(mw, 'W', K.get('BT_WIN_COMBOS', []), 'W', 'win')
         rec['回測飆股命中'] = _short(mf, 'F', K.get('BT_HOT_COMBOS', []), 'F', 'moon')
         # 2026-11-01 最高勝率／最高飆股率：只用三年回測驗證過的清單（勝率＝S、W；飆股率＝F），取 20 日（沒有就取各天期最高）
+        # 2026-11-03 本月建議組合用：S 或 W 命中、⚠️（毛利率年減≥2pp 或 近20日最大單日漲幅<3%）、營運雙優
+        _rw = r['row']
+        _gy = _rw.get('gmYoY') if isnum(_rw.get('gmYoY')) else None
+        _es = _rw.get('epsSurprise') if (isnum(_rw.get('epsSurprise')) and isnum(_rw.get('earnDays')) and _rw['earnDays'] <= 63) else None
+        rec['_sw'] = bool(ms or mw)
+        rec['_warn'] = bool((_gy is not None and _gy <= -2) or (isnum(_rw.get('max1d20')) and _rw['max1d20'] < 3))
+        rec['_dual'] = bool(_gy is not None and _gy >= 2 and _es is not None and _es >= 10)
         rec['最高勝率%'], rec['_winBy'] = _best_stat([('S', K['STOCK_PICK_COMBOS'], ms), ('W', K.get('BT_WIN_COMBOS', []), mw)], 'win', K, live)
         rec['最高飆股率%'], rec['_moonBy'] = _best_stat([('F', K.get('BT_HOT_COMBOS', []), mf)], 'moon', K, live)
         rec['命中數'] = len(ms) + len(mp) + len(mm)
@@ -4429,7 +4901,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
     results = []
     for i, sid in enumerate(stocks):
         try:
-            rows_full = fetch_price(sid, token, max(days, LONG_HISTORY_DAYS))
+            rows_full = fetch_price(sid, token, max(days, 1150 if ex_flags.get('fq') else LONG_HISTORY_DAYS))   # P/E 近3年位階要約3年股價
             rt = False
             if use_rt:
                 rows_full, rt = merge_realtime_quote(rows_full, fetch_quote(sid, token))
@@ -4453,6 +4925,11 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.3, log=Non
                     extras['peRangeErr'] = str(ex2)
             if vx_live:
                 tech['vix'] = vx_live[1][-1]
+            if ex_flags.get('fq'):   # 財報品質＋P/E 位階（季報三張表，用已公布的最新四季）
+                try:
+                    tech.update(fin_feats_series(bl, fetch_fin_hist(sid, token, limit=16), inclusive=True)[1](bl.n - 1))
+                except Exception as ex2:  # noqa
+                    extras['fqErr'] = str(ex2)[:150]
             if ex_flags.get('ev'):   # 評等升降／內部人買進／流通股數（各 1 次 API，內部人可能 1～2 次）
                 td_ = _ds(dt.date.today())
                 for fn_ in (lambda: shares_feats(td_, fetch_shares_hist(sid, token, limit=8), True),
@@ -4912,7 +5389,7 @@ def parse_stocks(txt):
     return [s.strip().upper() for s in re.split(r'[\n,，、\s]+', txt or '') if s.strip()]
 
 
-APP_VERSION = '2026-11-01 最高勝率／飆股標示'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
+APP_VERSION = '2026-11-04 移除逆向加碼選項'   # 部署後看側欄這行，確認 Streamlit 跑的是新版
 
 CSS = """
 <style>
@@ -5018,6 +5495,7 @@ def main():
         ex_flags = dict(pe=st.checkbox('📐 近3年P/E區間', key='x_pe'),
                         pt=st.checkbox('🎯 分析師目標價（上檔空間、近30日調整；每檔多1～3次API）', key='x_pt'),
                         ev=st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～4次API；⚠️三年交叉驗證無效，僅供參考）', key='x_ev'),
+                        fq=st.checkbox('💎 財報品質＋P/E位階（ROE、毛利率、自由現金流、應計比率、P/E近3年百分位；每檔多3次API）', key='x_fq'),
                         rev=st.checkbox('📈 近3季營收YoY/QoQ', key='x_rev'),
                         pxyoy=st.checkbox('💹 近3季均價YoY', key='x_pxyoy'),
                         sector=st.checkbox('🏭 類股狀態濾網（所屬類股ETF站上/跌破20、60日均線）', key='x_sector'))
@@ -5065,10 +5543,13 @@ def main():
         bt_sector = st.checkbox('🏭 類股狀態濾網（每檔多一次 sector 查詢）', key='bt_sector')
         bt_earn = st.checkbox('📊 財報驚喜／財報跳空（每檔多一次 earnings 查詢）', True, key='bt_earn',
                               help='美股最穩定的異常之一：財報 EPS 優於預期、財報日向上跳空的股票，之後1～3個月常持續走強（PEAD）')
-        bt_pt = st.checkbox('🎯 分析師目標價（price-target-news；每檔多1～15次查詢，大型股較多）', False, key='bt_pt',
-                            help='目標價上檔空間≥20%／≥40%、股價高於目標價、近30日目標價上調／下調。若方案不支援，前20檔都失敗會自動停止抓取')
+        bt_pt = st.checkbox('🎯 分析師目標價（price-target-news；每檔多1～15次查詢；⚠️三年驗證無效，不建議勾）', False, key='bt_pt',
+                            help='⚠️ 2026-11-02 全美股中小型股三年驗證：沒有一項三年都 t≥2（上檔空間大的偏彩券、跌>10%約19%），不建議勾。目標價上檔空間≥20%／≥40%、股價高於目標價、近30日目標價上調／下調。若方案不支援，前20檔都失敗會自動停止抓取')
         bt_ev = st.checkbox('🧾 評等升降／內部人買進／流通股數變化（每檔多3～6次查詢；⚠️2026-10-30 交叉驗證無效，不建議勾）', False, key='bt_ev',
                             help='近30日升評／降評、近90日內部人公開市場買進（1人／≥2人）、流通股數近一年減少≥2%（庫藏股）／增加≥5%（稀釋）。營收驚喜跟財報一起抓、VIX 整次回測抓一次，都不用另外勾')
+        bt_fq = st.checkbox('💎 財報品質＋P/E位階（季報三張表；每檔多3次查詢，股價多抓約2年）', False, key='bt_fq',
+                            help='2026-11-02 新增（待回測驗證）：P/E 在自己近3年的百分位、P/E<15／≥40倍、近四季虧損、ROE、毛利率年增／連2季年增、'
+                                 '自由現金流殖利率、應計比率（淨利−營業現金流）÷總資產。全部用 filingDate 當時已公布的季報。方案不支援季報時，前20檔都失敗會自動停止抓')
         bt_minpx = st.number_input('最低股價（美元，0＝不篩）', 0.0, 1000.0, 10.0, 1.0, key='bt_minpx',
                                    help='評估當天收盤價低於此價的紀錄不收（排除雞蛋水餃股，也省記憶體）')
         bt_liq = st.number_input('最低近20日均成交金額（萬美元，0＝不篩）', 0, 1000000, 1000, 100, key='bt_liq',
@@ -5175,14 +5656,15 @@ def main():
                             + (f'　｜{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_sector, bt_liq * 10000, vpp,
                                    delay=bt_delay, on_progress=onp, names=bt_names, workers=int(bt_workers), min_px=float(bt_minpx),
-                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev)
+                                   end_offset_months=bt_off, include_earn=bt_earn, include_pt=bt_pt, include_ev=bt_ev,
+                                   include_fq=bt_fq)
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             if stt.get('stopped'):
                 st.warning(f"⚠️ 回測提前結束：{stt['stopped']}")
             if stt.get('pt_err'):
                 st.warning('⚠️ ' + stt['pt_err'])
-            for k_ in ('ev_err', 'vix_err'):
+            for k_ in ('ev_err', 'fq_err', 'vix_err'):
                 if stt.get(k_):
                     st.warning('⚠️ ' + stt[k_])
             if stt.get('bm_err'):
@@ -5255,7 +5737,7 @@ def render_batch(st, ss, K):
                 st.success(f"✅ 已加入「{_ln}」：新增 {_n} 檔（重複的略過），清單共 {len(ss['lists'][_ln])} 檔")
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
-        st.caption('S＝選股型：2023-10～2026-09 美股三年回測（分六個半年），每一年扣掉同一天大盤後都仍有超額報酬（依日 t≥2）、六個半年至少五個為正，最值得看（約每20日 +1.0～1.5%）；S6～S8 為 2026-10-22 用全美股2000-B 新增（含高特有波動／高Beta／類股動能，波動較大，S8 需勾類股濾網），2026-10-30 已在另一批股票交叉驗證（S1～S8 超額報酬全部為正）。'
+        st.caption('S＝選股型：2023-10～2026-09 美股三年回測（分六個半年），每一年扣掉同一天大盤後都仍有超額報酬（依日 t≥2）、六個半年至少五個為正，最值得看（約每20日 +1.0～1.5%）；S6～S8 為 2026-10-22 用全美股2000-B 新增（含高特有波動／高Beta／類股動能，波動較大，S8 需勾類股濾網），2026-10-30 已在另一批股票交叉驗證（S1～S8 超額報酬全部為正）；S9 為 2026-11-03 新增（營運雙優＋高Beta，需勾「💎 財報品質」）；⚠️ 進攻型：2026-11-04 第三批股票驗證超額 +0.88%，但 2024-11～2025-10 那一年失效、跌>10% 約兩成，可搭配移動停利10%。'
                    '#＝高勝率；標 ⏱ 的是擇時型（含布林低檔／大盤或類股跌破均線），勝率主要來自大盤反彈，適合判斷大盤落底，不適合當選股依據。'
                    '⚠️ #、M 的歷史統計是 2026-09-21 美股回測（舊版分價量表、夜星未限高檔）記錄的。')
         t0 = pd.DataFrame([{'編號': f'S{i + 1}', '條件組合': '＋'.join(c),
@@ -5283,6 +5765,25 @@ def render_batch(st, ss, K):
         st.dataframe(tw_, hide_index=True, use_container_width=True, height=240)
         st.dataframe(tf_, hide_index=True, use_container_width=True, height=240)
 
+    _pm, _ps = monthly_picks(df)
+    if _pm is not None:
+        with st.expander(f'📦 本月建議組合（主力 {len(_pm)} 檔／保守 {len(_ps)} 檔；每20個交易日換股一次、等權重）', expanded=False):
+            st.caption('依美股三年投資組合模擬（三組樣本、每20個交易日換股、扣0.2%成本）：主力＝命中 S 或 W、排除⚠️毛利率年減／近20日平淡，依多方力道取前20檔'
+                       '（年化約 22～36%、最大回撤約 −25～−28%，報酬勝過等權大盤但波動較大）；保守＝營運雙優（毛利率年增≥2pp＋EPS大幅優於預期≥10%），'
+                       '新股票驗證夏普最高、回撤接近大盤（需勾「💎 財報品質」）。'
+                       '**出場：抱滿20個交易日再換股，不設固定停損**（2026-11-04 三年回測：停損−8% 年化約砍半、夏普全部變差；空頭時訊號常先洗再漲）；'
+                       '要控制風險請用大盤指引的建議持股調整總資金。S9／彩券型怕大回撤可改用「移動停利10%」（自進場後最高收盤回落10%出場，S9 回撤 −32%→−20%，年化少約11個百分點）。只有三年樣本，僅供參考。')
+            _cols = [c for c in ('股票', '名稱', '類股', '股價', '多方力道', '選股型命中', '回測高勝率命中', '組合型態', '大盤適用', '財報訊號') if c in df.columns]
+            _a, _b = st.columns(2)
+            _a.markdown('**🚀 主力組合**（S 或 W，排除⚠️）')
+            _a.dataframe(_pm[_cols], hide_index=True, use_container_width=True)
+            _b.markdown('**🛡️ 保守組合**（營運雙優）' + ('' if len(_ps) else '　— 沒有符合的股票，或沒勾「💎 財報品質＋P/E位階」'))
+            if len(_ps):
+                _b.dataframe(_ps[_cols], hide_index=True, use_container_width=True)
+            if st.button(f'📥 主力組合 {len(_pm)} 檔存成「我的清單4」（覆蓋）', key='pick_to_list4', disabled=not len(_pm)):
+                ss['lists']['我的清單4'] = [str(x) for x in _pm['股票']]
+                save_custom_lists(ss['lists'])
+                st.success(f'✅ 已存成「我的清單4」（{len(_pm)} 檔）')
     _tl = top_mark_lines(df)
     if _tl:
         st.info('\n\n'.join(_tl) + '\n\n（摘要表「🏅標示」欄同步標出；勝率／飆股率取命中組合中最高的一個，只用三年回測驗證過的 S／W／F 清單）')
@@ -5309,7 +5810,7 @@ def render_batch(st, ss, K):
         m &= df['_regOk'] > 0
     elif f_rg == '不含❌' and '_regBad' in df.columns:
         m &= df['_regBad'] == 0
-    view = df[m].drop(columns=['_pbPass', '_pt', '_regOk', '_regBad', '_winBy', '_moonBy'], errors='ignore')
+    view = df[m].drop(columns=['_pbPass', '_pt', '_regOk', '_regBad', '_winBy', '_moonBy', '_sw', '_warn', '_dual'], errors='ignore')
     st.caption(f'顯示 {len(view)} / {len(df)} 檔（點欄位標題可排序）')
     colcfg = {c: st.column_config.NumberColumn(format='%.1f') for c in
               ['+DI', '-DI', 'ADX', 'ADXR', '布林位置%', '布林寬度%', 'RS(vs SPY)%', 'P/E', '目標價上檔空間%', '營收YoY%(最新季)',
@@ -6340,6 +6841,8 @@ STOCK_PICK_COMBOS = [
     ["高特有波動(年化≥60%)", "近1季財報EPS大幅優於預期(≥10%)", "漲時量≥跌時量1.5倍(近20日)"],
     ["高Beta(>1.5)", "布林通道高檔(≥80%)", "CMF資金流買方佔優(近20日≥0.1)"],
     ["所屬類股近6個月弱於大盤", "近1季財報EPS優於預期", "中期強勢(12-1月勝大盤≥20%)"],
+    # 2026-11-03 新增 S9（營運雙優＋高Beta：前兩批股票各自三年依日 t 都≥3.8；2026-11-04 第三批新股票 +0.88%、2024-11～2025-10 失效 → ⚠️ 進攻型，跌>10%約兩成；需勾「💎 財報品質」）
+    ["毛利率年增≥2pp(最新季)", "近1季財報EPS大幅優於預期(≥10%)", "高Beta(>1.5)"],
 ]
 STOCK_PICK_STATS = {
     "近1季財報EPS大幅優於預期(≥10%) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 29516, "win": 55.6, "ret": 1.35, "ex": 0.81, "t": 16.0}, "20": {"n": 29516, "win": 56.3, "ret": 2.65, "ex": 1.36, "t": 18.35}},
@@ -6351,6 +6854,7 @@ STOCK_PICK_STATS = {
     "高特有波動(年化≥60%) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 漲時量≥跌時量1.5倍(近20日)": {"10": {"n": 6481, "win": 54.8, "ret": 1.84, "ex": 1.28, "t": 5.59}, "20": {"n": 6481, "win": 55.3, "ret": 3.58, "ex": 2.49, "t": 9.25}},
     "高Beta(>1.5) ＋ 布林通道高檔(≥80%) ＋ CMF資金流買方佔優(近20日≥0.1)": {"10": {"n": 12107, "win": 54.9, "ret": 1.78, "ex": 1.27, "t": 6.38}, "20": {"n": 12107, "win": 54.7, "ret": 2.92, "ex": 1.93, "t": 7.89}},
     "所屬類股近6個月弱於大盤 ＋ 近1季財報EPS優於預期 ＋ 中期強勢(12-1月勝大盤≥20%)": {"10": {"n": 38039, "win": 54.7, "ret": 1.3, "ex": 0.73, "t": 7.96}, "20": {"n": 38039, "win": 55.5, "ret": 2.66, "ex": 1.54, "t": 12.31}},
+    "毛利率年增≥2pp(最新季) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 高Beta(>1.5)": {"10": {"n": 14153, "win": 53.3, "ret": 1.35, "ex": 0.91, "t": 6.65}, "20": {"n": 14153, "win": 54.0, "ret": 2.8, "ex": 1.79, "t": 9.25}},
 }
 # 2026-09-27 美股回測（勝率榜5/10/20日＋飆股榜5/10/20日）中，指定組合的勝率／t值(同日調整)／飆股比例記錄值
 # key＝條件依字元排序後以「 ＋ 」連接
@@ -6441,7 +6945,6 @@ PINNED_COMBOS = [
     ["大盤跌破20日均線", "大盤跌破60日均線", "突破飆股大量黑K最高點剛形成"],
     ["近1季乖離度為負(股價超前營收)", "近1季均價YoY為正", "夜星剛形成"],
     ["大盤跌破60日均線", "型態突破確認", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥80", "相對強弱為負(弱於大盤)", "近1季乖離度為正(營收優於股價)"],
     ["大盤站上20日均線", "大盤跌破60日均線", "突破ABC修正下降切線剛形成"],
     ["近1季乖離度為正(營收優於股價)", "近1季均價YoY為正", "複式頭肩底剛形成"],
     ["大盤站上20日均線", "突破飆股大量黑K最高點剛形成", "K線橫盤的突破剛形成"],
@@ -6499,7 +7002,6 @@ MOONSHOT_COMBOS = [
     ["爆量(≥1.5倍均量)", "型態剛形成(剛突破)", "夜星剛形成"],
     ["爆量(≥1.5倍均量)", "型態成形中", "夜星剛形成"],
     ["布林通道低檔(≤20%)", "近1季均價YoY為正", "夜星剛形成"],
-    ["相對強弱為正(強於大盤)", "近1季均價YoY為正", "夜星剛形成"],
     ["相對強弱為正(強於大盤)", "大盤站上20日均線", "夜星剛形成"],
     ["布林通道低檔(≤20%)", "大盤跌破60日均線", "夜星剛形成"],
     ["KDJ近3日內死亡交叉", "近1季均價YoY為正", "夜星剛形成"],
@@ -6507,44 +7009,24 @@ MOONSHOT_COMBOS = [
     ["KDJ近3日內黃金交叉", "大盤站上20日均線", "夜星剛形成"],
     ["布林通道低檔(≤20%)", "大盤跌破20日均線", "夜星剛形成"],
     ["KDJ近3日內死亡交叉", "近1季乖離度為負(股價超前營收)", "夜星剛形成"],
-    ["KDJ近3日內死亡交叉", "相對強弱為正(強於大盤)", "夜星剛形成"],
-    ["KDJ近3日內死亡交叉", "大盤站上20日均線", "夜星剛形成"],
     ["布林通道低檔(≤20%)", "KDJ近3日內黃金交叉", "母子懷抱(高檔)剛形成"],
     ["大盤跌破60日均線", "近1季均價YoY為正", "夜星剛形成"],
     ["相對強弱為正(強於大盤)", "近1季乖離度為負(股價超前營收)", "夜星剛形成"],
-    ["KDJ近3日內死亡交叉", "大盤站上60日均線", "夜星剛形成"],
     ["多方力道≥80", "MACD近3日內黃金交叉", "突破ABC修正下降切線剛形成"],
     ["爆量(≥1.5倍均量)", "大盤站上20日均線", "晨星剛形成"],
-    ["大盤站上20日均線", "近1季乖離度為負(股價超前營收)", "夜星剛形成"],
     ["多方力道≥65", "爆量(≥2倍均量)", "突破ABC修正下降切線剛形成"],
     ["多方力道≥80", "爆量(≥1.5倍均量)", "突破ABC修正下降切線剛形成"],
     ["爆量(≥1.5倍均量)", "近1季均價YoY為正", "晨星剛形成"],
-    ["大盤站上20日均線", "近1季均價YoY為正", "夜星剛形成"],
-    ["大盤站上60日均線", "近1季乖離度為負(股價超前營收)", "夜星剛形成"],
     ["近1季乖離度為負(股價超前營收)", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
     ["爆量(≥1.5倍均量)", "大盤站上60日均線", "晨星剛形成"],
     ["近1季均價YoY為正", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["大盤站上60日均線", "近1季均價YoY為正", "夜星剛形成"],
-    ["相對強弱為正(強於大盤)", "大盤站上60日均線", "夜星剛形成"],
     ["強勢突破盤", "爆量(≥2倍均量)", "突破ABC修正下降切線剛形成"],
-    ["爆量(≥1.5倍均量)", "型態突破確認", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "型態剛形成(剛突破)", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "型態成形中", "晨星剛形成"],
-    ["大盤站上60日均線", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["大盤站上20日均線", "大盤站上60日均線", "夜星剛形成"],
     ["爆量(≥2倍均量)", "近1季乖離度為正(營收優於股價)", "突破ABC修正下降切線剛形成"],
     ["多方力道≥80", "爆量(≥2倍均量)", "突破飆股大量黑K最高點剛形成"],
     ["多方力道≥65", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["相對強弱為正(強於大盤)", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥65", "KDJ近3日內死亡交叉", "夜星剛形成"],
-    ["型態成形中", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["型態剛形成(剛突破)", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
     ["大盤跌破20日均線", "突破ABC修正下降切線剛形成", "K線橫盤的突破剛形成"],
     ["多方力道≥80", "回後買上漲全通過", "突破飆股大量黑K最高點剛形成"],
     ["爆量(≥2倍均量)", "圓弧底剛形成", "K線橫盤的突破剛形成"],
-    ["型態突破確認", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
     # 2026-09-30 三年回測：20日飆股比例三段都 ≥2 倍基準。⚠️最後一組飆股比例高但平均報酬為負（勝率約42%），屬高風險彩券型
     ["大盤跌破60日均線", "夜星剛形成"],
     ["KDJ近3日內死亡交叉", "大盤跌破60日均線", "夜星剛形成"],
@@ -7334,444 +7816,422 @@ BT_HOT_STATS = {
 }
 BT_HIT_SHOW = 3   # 摘要表每類最多顯示幾個編號，其餘以「+N」表示
 
-# ── 大盤狀態分組回測（2026-10-05 三年六段回測，20日超額報酬）：每個清單組合在四種大盤狀態下的 [筆數, 勝率%, 同日超額%, t(依日)]，
+# ── 大盤狀態分組回測（2026-11-03 重算：合併七輪全美股三年六段回測（合計約 310 萬筆，同一天同一檔重複的只算一次），20日超額報酬）：每個清單組合在四種大盤狀態下的 [筆數, 勝率%, 同日超額%, t(依日)]，
 #    依序為 ①多頭（SPY站上月線與季線）②多頭回檔（跌破月線、守季線）③空頭反彈（站上月線、季線下）④空頭（跌破月線與季線）；樣本<30筆為 None
 REGIME_STATS = {
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[22465, 55.8, 1.36, 7.76], [2674, 52.5, -0.62, 1.02], [741, 65.6, 3.99, 4.79], [3636, 60.6, 2.28, 6.21]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近20日強於大盤≥10%": [[17525, 54.5, 1.74, 8.32], [2504, 48.2, -1.42, 0.53], [479, 68.9, 6.0, 4.66], [2778, 55.1, 1.74, 4.04]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道收窄(寬度近半年最低20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[14318, 52.5, 0.67, 4.61], [2185, 58.9, 2.08, 4.35], [241, 61.8, 2.28, 0.15], [2152, 63.9, 2.46, 5.36]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": [[5724, 54.9, 1.0, 3.7], [539, 59.6, 1.65, 1.46], [131, 58.0, 1.71, 1.88], [1043, 64.3, 2.43, 2.79]],
-    "創52週新高 ＋ 大盤站上20日均線 ＋ 近20日強於大盤≥10%": [[17167, 51.7, 1.1, 6.62], None, [299, 60.5, 1.31, -1.51], None],
-    "大盤站上20日均線 ＋ 大盤跌破60日均線 ＋ 爆量(≥2倍均量)": [None, None, [541, 74.7, 1.43, 0.68], None],
-    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [196, 62.8, 4.82, 1.15]],
-    "夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [196, 62.8, 4.82, 1.15]],
-    "型態成形中 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [196, 62.8, 4.82, 1.15]],
-    "型態突破確認 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [196, 62.8, 4.82, 1.15]],
-    "夜星剛形成 ＋ 大盤跌破20日均線 ＋ 大盤跌破60日均線": [None, None, None, [196, 62.8, 4.82, 1.15]],
-    "KDJ近3日內黃金交叉 ＋ 大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成": [None, None, None, [338, 57.1, 2.29, 2.48]],
-    "大盤跌破60日均線 ＋ 相對強弱為正(強於大盤) ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [281, 60.5, 0.98, 1.32]],
-    "布林通道低檔(≤20%) ＋ 爆量(≥2倍均量) ＋ 相對強弱為正(強於大盤)": [[50, 36.0, -2.88, -1.89], [107, 62.6, 0.47, -0.48], None, [413, 67.8, -0.41, -0.85]],
-    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 大盤跌破20日均線": [None, [162, 51.9, -0.64, -1.94], None, [196, 62.8, 4.82, 1.15]],
-    "型態突破確認 ＋ 夜星剛形成 ＋ 大盤跌破20日均線": [None, [162, 51.9, -0.64, -1.94], None, [196, 62.8, 4.82, 1.15]],
-    "型態成形中 ＋ 夜星剛形成 ＋ 大盤跌破20日均線": [None, [162, 51.9, -0.64, -1.94], None, [196, 62.8, 4.82, 1.15]],
-    "夜星剛形成 ＋ 大盤跌破20日均線": [None, [162, 51.9, -0.64, -1.94], None, [196, 62.8, 4.82, 1.15]],
-    "大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成 ＋ 相對強弱為正(強於大盤)": [None, None, None, [321, 59.8, 2.25, -0.83]],
-    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[196, 46.9, -0.62, -0.11], [36, 44.4, -3.21, -1.55], None, [39, 69.2, 9.12, 1.99]],
-    "型態成形中 ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[196, 46.9, -0.62, -0.11], [36, 44.4, -3.21, -1.55], None, [39, 69.2, 9.12, 1.99]],
-    "型態突破確認 ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[196, 46.9, -0.62, -0.11], [36, 44.4, -3.21, -1.55], None, [39, 69.2, 9.12, 1.99]],
-    "夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[196, 46.9, -0.62, -0.11], [36, 44.4, -3.21, -1.55], None, [39, 69.2, 9.12, 1.99]],
-    "大盤跌破20日均線 ＋ 大盤跌破60日均線 ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [293, 59.4, 0.76, 0.99]],
-    "型態突破確認 ＋ 大盤跌破60日均線 ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [293, 59.4, 0.76, 0.99]],
-    "大盤站上20日均線 ＋ 大盤跌破60日均線 ＋ 突破ABC修正下降切線剛形成": [None, None, [346, 65.9, 1.26, 1.33], None],
-    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 大盤站上60日均線": [[664, 45.6, -1.04, 0.48], [162, 51.9, -0.64, -1.94], None, None],
-    "夜星剛形成 ＋ 大盤站上60日均線": [[664, 45.6, -1.04, 0.48], [162, 51.9, -0.64, -1.94], None, None],
-    "型態成形中 ＋ 夜星剛形成 ＋ 大盤站上60日均線": [[664, 45.6, -1.04, 0.48], [162, 51.9, -0.64, -1.94], None, None],
-    "型態突破確認 ＋ 夜星剛形成 ＋ 大盤站上60日均線": [[664, 45.6, -1.04, 0.48], [162, 51.9, -0.64, -1.94], None, None],
-    "KDJ近3日內死亡交叉 ＋ 型態剛形成(剛突破) ＋ 夜星剛形成": [[429, 46.2, -0.94, 0.06], [116, 54.3, -0.89, -1.79], None, [135, 65.9, 5.82, 1.13]],
-    "KDJ近3日內死亡交叉 ＋ 夜星剛形成": [[429, 46.2, -0.94, 0.06], [116, 54.3, -0.89, -1.79], None, [135, 65.9, 5.82, 1.13]],
-    "KDJ近3日內死亡交叉 ＋ 型態成形中 ＋ 夜星剛形成": [[429, 46.2, -0.94, 0.06], [116, 54.3, -0.89, -1.79], None, [135, 65.9, 5.82, 1.13]],
-    "KDJ近3日內死亡交叉 ＋ 型態突破確認 ＋ 夜星剛形成": [[429, 46.2, -0.94, 0.06], [116, 54.3, -0.89, -1.79], None, [135, 65.9, 5.82, 1.13]],
-    "K線橫盤的突破剛形成 ＋ 大盤站上20日均線 ＋ 突破飆股大量黑K最高點剛形成": [[412, 55.8, 0.68, 1.55], None, None, None],
-    "布林通道低檔(≤20%) ＋ 爆量(≥1.5倍均量) ＋ 相對強弱為正(強於大盤)": [[159, 47.2, -0.32, -0.29], [201, 63.2, 1.23, 1.08], None, [1398, 72.3, 0.01, -0.09]],
-    "夜星剛形成 ＋ 大盤站上20日均線": [[664, 45.6, -1.04, 0.48], None, None, None],
-    "K線橫盤的突破剛形成 ＋ 大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤)": [None, None, [76, 67.1, -1.52, -1.87], [425, 67.1, 0.57, -2.05]],
-    "多方力道≥65 ＋ 強勢突破盤 ＋ 頭肩底剛形成": [[280, 51.8, -0.55, -1.16], [31, 64.5, 0.72, 0.72], None, None],
-    "大盤跌破20日均線 ＋ 相對強弱為正(強於大盤) ＋ 複式頭肩底剛形成": [None, [213, 52.1, -1.15, -0.01], None, [156, 56.4, -0.67, 0.06]],
-    "大盤跌破20日均線 ＋ 複式頭肩底剛形成": [None, [217, 52.1, -1.22, -0.12], None, [156, 56.4, -0.67, 0.06]],
-    "KDJ近3日內黃金交叉 ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": [None, None, [1905, 69.8, 2.03, 0.99], [5027, 62.6, 1.03, -1.59]],
-    "型態突破確認 ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[144, 40.3, -2.08, -2.65], [45, 46.7, -0.98, -2.51], None, [37, 64.9, 1.97, 0.76]],
-    "夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[144, 40.3, -2.08, -2.65], [45, 46.7, -0.98, -2.51], None, [37, 64.9, 1.97, 0.76]],
-    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[144, 40.3, -2.08, -2.65], [45, 46.7, -0.98, -2.51], None, [37, 64.9, 1.97, 0.76]],
-    "型態成形中 ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[144, 40.3, -2.08, -2.65], [45, 46.7, -0.98, -2.51], None, [37, 64.9, 1.97, 0.76]],
-    "夜星剛形成 ＋ 大盤站上20日均線 ＋ 相對強弱為正(強於大盤)": [[468, 45.1, -1.22, 0.36], None, None, None],
-    "夜星剛形成 ＋ 大盤跌破60日均線 ＋ 布林通道低檔(≤20%)": [None, None, None, [32, 50.0, -0.25, -0.25]],
-    "大盤站上60日均線 ＋ 布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成": [[140, 57.1, 1.63, 2.09], [40, 52.5, -1.4, -0.89], None, None],
-    "KDJ近3日內黃金交叉 ＋ 夜星剛形成 ＋ 大盤站上20日均線": [[220, 50.5, -0.45, -0.98], None, None, None],
-    "夜星剛形成 ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, None, None, [32, 50.0, -0.25, -0.25]],
-    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 相對強弱為正(強於大盤)": [[300, 45.3, -1.4, -0.22], [86, 58.1, 0.09, -1.43], None, [113, 62.8, 4.66, 0.27]],
-    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 大盤站上20日均線": [[429, 46.2, -0.94, 0.06], None, None, None],
-    "KDJ近3日內黃金交叉 ＋ 布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成": [[72, 52.8, 0.97, 1.86], None, None, [132, 73.5, 3.72, 0.49]],
-    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 大盤站上60日均線": [[429, 46.2, -0.94, 0.06], [116, 54.3, -0.89, -1.79], None, None],
-    "MACD近3日內黃金交叉 ＋ 多方力道≥80 ＋ 突破ABC修正下降切線剛形成": [[107, 57.9, 0.81, 0.56], None, None, None],
-    "大盤站上20日均線 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], None, None, None],
-    "多方力道≥65 ＋ 爆量(≥2倍均量) ＋ 突破ABC修正下降切線剛形成": [[208, 50.0, 0.52, 0.37], [50, 46.0, -2.62, -1.47], None, None],
-    "多方力道≥80 ＋ 爆量(≥1.5倍均量) ＋ 突破ABC修正下降切線剛形成": [[186, 53.8, 1.06, 0.93], [34, 52.9, -3.29, -1.5], None, None],
-    "大盤站上60日均線 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], [95, 55.8, -1.73, 0.31], None, None],
-    "夜星剛形成 ＋ 大盤站上60日均線 ＋ 相對強弱為正(強於大盤)": [[468, 45.1, -1.22, 0.36], [126, 54.0, 0.1, -1.62], None, None],
-    "強勢突破盤 ＋ 爆量(≥2倍均量) ＋ 突破ABC修正下降切線剛形成": [[296, 51.4, 0.92, 0.97], [51, 41.2, -3.9, -3.82], None, [41, 58.5, -1.59, -0.5]],
-    "型態突破確認 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], [95, 55.8, -1.73, 0.31], None, [63, 50.8, -2.0, -1.65]],
-    "晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], [95, 55.8, -1.73, 0.31], None, [63, 50.8, -2.0, -1.65]],
-    "型態剛形成(剛突破) ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], [95, 55.8, -1.73, 0.31], None, [63, 50.8, -2.0, -1.65]],
-    "型態成形中 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[242, 50.4, 0.92, -0.2], [95, 55.8, -1.73, 0.31], None, [63, 50.8, -2.0, -1.65]],
-    "大盤站上60日均線 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[273, 50.9, -0.42, -1.14], [52, 55.8, 0.07, -0.01], None, None],
-    "夜星剛形成 ＋ 大盤站上20日均線 ＋ 大盤站上60日均線": [[664, 45.6, -1.04, 0.48], None, None, None],
-    "多方力道≥80 ＋ 爆量(≥2倍均量) ＋ 突破飆股大量黑K最高點剛形成": [[135, 60.0, 2.7, 2.09], None, None, None],
-    "多方力道≥65 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[119, 51.3, -0.53, -0.73], None, None, None],
-    "相對強弱為正(強於大盤) ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[249, 51.4, -0.2, -0.9], [48, 54.2, -0.46, -0.35], None, [39, 76.9, 2.89, 1.9]],
-    "KDJ近3日內死亡交叉 ＋ 多方力道≥65 ＋ 夜星剛形成": [[207, 44.0, -1.99, -0.58], [45, 57.8, -1.09, -2.01], None, [38, 52.6, 1.06, -0.33]],
-    "型態成形中 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[273, 50.9, -0.42, -1.14], [52, 55.8, 0.07, -0.01], None, [39, 76.9, 2.89, 1.9]],
-    "型態剛形成(剛突破) ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[273, 50.9, -0.42, -1.14], [52, 55.8, 0.07, -0.01], None, [39, 76.9, 2.89, 1.9]],
-    "K線橫盤的突破剛形成 ＋ 大盤跌破20日均線 ＋ 突破ABC修正下降切線剛形成": [None, [107, 60.7, 2.34, -0.65], None, [75, 56.0, -0.4, -0.81]],
-    "回後買上漲全通過 ＋ 多方力道≥80 ＋ 突破飆股大量黑K最高點剛形成": [[180, 51.1, 1.04, 0.34], None, None, None],
-    "K線橫盤的突破剛形成 ＋ 圓弧底剛形成 ＋ 爆量(≥2倍均量)": [[137, 50.4, 0.58, 0.62], None, None, None],
-    "型態突破確認 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[273, 50.9, -0.42, -1.14], [52, 55.8, 0.07, -0.01], None, [39, 76.9, 2.89, 1.9]],
-    "突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[273, 50.9, -0.42, -1.14], [52, 55.8, 0.07, -0.01], None, [39, 76.9, 2.89, 1.9]],
-    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [135, 65.9, 5.82, 1.13]],
-    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 量能區間高檔(≥90百分位)": [[85, 48.2, 3.47, 1.46], None, None, None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [4615, 65.3, 2.17, 4.69], [33732, 60.2, 1.69, 8.69]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [2054, 68.0, 3.72, 6.45], [15105, 61.5, 2.05, 8.13]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS優於預期": [None, None, [3364, 67.3, 2.76, 5.32], [24419, 61.0, 1.72, 7.75]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 布林通道低檔(≤20%)": [None, None, [279, 77.1, 3.98, 4.5], [11682, 62.5, 2.02, 8.09]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近1季財報EPS優於預期": [[34409, 55.5, 1.06, 6.82], [3920, 54.3, -0.34, 1.31], [1093, 65.0, 2.77, 4.28], [5699, 60.2, 1.97, 6.98]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 大盤跌破60日均線": [None, None, None, [33732, 60.2, 1.69, 8.69]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, [5275, 60.1, 1.82, 4.44], None, [11682, 62.5, 2.02, 8.09]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤)": [None, None, [1994, 63.0, 0.17, 0.49], [19126, 60.5, 1.89, 8.24]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%)": [[44888, 54.6, 0.95, 7.4], [5246, 53.1, -0.46, 0.58], [1537, 61.0, 1.72, 3.48], [8076, 58.9, 1.86, 5.77]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [7095, 65.1, 1.35, 6.22], [48604, 58.9, 0.44, 5.95]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能區間高檔(≥90百分位)": [None, None, [962, 71.0, 1.45, 3.53], [8587, 59.6, 1.07, 5.45]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 相對強弱為負(弱於大盤)": [None, [10084, 57.1, 1.15, 3.2], None, [19126, 60.5, 1.89, 8.24]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近5日跌幅≥8%(短線超跌)": [None, None, [129, 67.4, 1.65, 0.37], [4881, 60.1, 3.12, 6.86]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 相對強弱為正(強於大盤)": [None, None, [2621, 67.0, 3.69, 5.3], [14606, 59.7, 1.42, 6.59]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS優於預期 ＋ 量能區間高檔(≥90百分位)": [None, None, [1868, 70.8, 0.49, 2.14], [18012, 59.1, 0.5, 4.35]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破60日均線": [None, None, [3225, 63.4, 1.69, 3.2], [25107, 60.7, 1.75, 7.01]],
-    "大盤跌破20日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, [14693, 58.0, 0.68, 4.12], None, [24193, 60.8, 0.97, 5.24]],
-    "大盤跌破20日均線 ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, None, [48604, 58.9, 0.44, 5.95]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS低於預期": [None, None, [1027, 59.2, 0.62, 0.84], [6961, 60.8, 1.82, 8.12]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能區間高檔(≥90百分位)": [[5985, 55.8, 1.57, 5.49], [949, 46.5, -2.46, -0.96], [196, 66.3, 0.87, 0.4], [1387, 58.0, 2.53, 2.86]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1521, 57.0, 3.81, 6.43], [120, 51.7, -1.2, -0.81], None, [121, 43.0, -1.13, -0.67]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 近1季財報EPS低於預期": [None, [3867, 53.6, -0.01, 0.37], None, [6961, 60.8, 1.82, 8.12]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, None, [584, 67.5, 1.36, 2.54], [4616, 61.5, 1.38, 4.27]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, None, [925, 69.2, 1.62, 4.08], [6876, 63.2, 0.5, 3.75]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [2401, 63.5, 1.75, 4.47], [18779, 60.7, 1.17, 5.48]],
-    "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 量能區間高檔(≥90百分位)": [None, None, [1527, 69.7, 0.05, -0.01], [14399, 59.7, 0.63, 2.57]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [None, None, [685, 64.4, 1.58, 2.86], [5899, 62.8, 0.74, 3.61]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近20日財報跳空上漲": [[1740, 59.7, 3.45, 5.14], [143, 53.1, 0.13, -1.29], None, [161, 54.0, 4.37, 5.19]],
-    "KDJ近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [1424, 68.5, 3.24, 2.46], [10014, 60.5, 1.52, 4.74]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 近5日跌幅≥8%(短線超跌)": [None, [2421, 53.5, 0.37, 1.07], None, [4881, 60.1, 3.12, 6.86]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 近1季財報EPS優於預期": [[12933, 51.1, 0.42, 2.31], [3994, 61.3, 2.02, 4.3], [194, 77.8, 4.78, 5.07], [8580, 63.2, 2.03, 7.39]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近20日財報跳空上漲": [[1945, 58.0, 2.92, 5.5], [146, 52.1, -0.32, -0.96], [33, 100.0, 6.33, 3.1], [187, 52.9, 2.96, 1.61]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上20日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [[67750, 54.8, 0.55, 7.58], None, [2285, 65.5, 1.81, 2.11], None],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[2343, 46.8, -0.02, 1.75], [667, 53.8, -0.34, 1.52], [80, 67.5, 1.69, 1.69], [1995, 59.1, 2.58, 3.69]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 相對強弱為負(弱於大盤)": [[17241, 50.7, 0.38, 2.25], [4946, 60.1, 1.81, 4.35], [264, 76.9, 3.82, 4.21], [9990, 61.7, 2.09, 8.25]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[3111, 57.4, 3.62, 7.23], [334, 45.5, -3.01, -2.29], None, [225, 44.0, -0.28, -1.52]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, [6480, 60.6, 1.33, 3.66], None, [15546, 63.0, 1.27, 4.67]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近20日強於大盤≥10%": [None, None, [894, 73.4, 7.64, 5.45], [4791, 55.9, 1.49, 3.67]],
-    "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [3290, 63.4, 0.23, 0.56], [24193, 60.8, 0.97, 5.24]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%)": [[17596, 50.7, 0.38, 2.3], [5275, 60.1, 1.82, 4.44], [279, 77.1, 3.98, 4.5], [11682, 62.5, 2.02, 8.09]],
-    "短線過熱(高於月線≥20%) ＋ 距52週高點≤5% ＋ 近20日財報跳空上漲": [[1325, 56.6, 2.33, 4.71], [97, 49.5, 0.41, 0.36], None, [83, 53.0, 4.03, 2.42]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥65": [[22572, 55.9, 1.45, 7.75], [2355, 51.5, -0.55, -0.42], [272, 54.4, 0.54, -0.35], [1911, 50.0, 1.18, 1.66]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3836, 50.4, 0.23, 1.77], [1002, 62.6, 1.6, 3.37], [117, 75.2, 2.45, 2.92], [2126, 61.2, 1.59, 4.23]],
-    "NR7窄幅日(近7日振幅最小) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [815, 62.9, 1.52, 0.3], [4750, 59.5, 1.61, 4.63]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線": [None, [20763, 54.9, 0.21, 1.54], None, [33732, 60.2, 1.69, 8.69]],
-    "大盤跌破20日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, [4367, 59.7, 0.22, 0.48], None, [6876, 63.2, 0.5, 3.75]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%)": [[1593, 55.6, 0.98, 2.84], [393, 60.8, 1.13, 2.74], None, [1532, 65.9, 2.93, 5.58]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[6201, 55.6, 1.29, 5.78], [686, 50.7, -1.38, -1.24], [219, 65.3, 1.7, 1.61], [1085, 57.4, 1.22, 0.64]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 量能區間高檔(≥90百分位)": [None, None, [559, 69.8, 2.47, 2.26], [5635, 57.7, 1.86, 5.62]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, [2818, 56.7, -0.09, 1.33], None, [4616, 61.5, 1.38, 4.27]],
-    "大盤跌破60日均線 ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [None, None, [180, 60.6, -1.91, -2.25], [3869, 60.9, 1.09, 3.95]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 布林通道低檔(≤20%)": [[12337, 49.4, 0.26, 1.77], [3810, 59.8, 1.82, 3.89], [182, 75.3, 3.5, 3.15], [8802, 62.3, 2.01, 7.04]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[566, 52.5, 3.01, 3.94], [71, 36.6, -5.82, -3.34], None, [49, 51.0, -0.98, -0.78]],
-    "多方力道≥80 ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[98, 48.0, 0.36, 0.22], None, None, None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1047, 53.2, 3.07, 4.34], [119, 30.3, -7.37, -3.03], None, [82, 54.9, 2.29, 0.4]],
-    "KDJ近3日內死亡交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[427, 54.3, 2.88, 2.84], [54, 24.1, -8.37, -3.22], None, [37, 51.4, 1.51, 0.92]],
-    "回後買上漲全通過 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[700, 52.1, 2.54, 2.48], [79, 36.7, -4.42, -2.04], None, [72, 45.8, -0.63, -1.12]],
-    "KDJ近3日內死亡交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[914, 56.2, 3.79, 5.35], [107, 32.7, -7.63, -1.23], None, [63, 60.3, 2.83, 1.02]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[1984, 54.2, 3.29, 4.25], [201, 38.8, -6.65, -1.41], [48, 95.8, 13.15, 5.36], [118, 45.8, -0.28, 0.19]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1342, 52.2, 2.64, 5.24], [149, 37.6, -5.04, -2.21], None, [89, 49.4, -0.02, -0.09]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[2675, 54.8, 3.41, 6.88], [223, 41.3, -4.0, -0.23], [49, 87.8, 8.51, 5.16], [166, 53.6, 2.09, -0.27]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[930, 53.1, 2.08, 2.98], [89, 43.8, -2.67, -2.39], None, [82, 43.9, -2.47, -1.48]],
-    "多方力道≥80 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[625, 54.9, 2.33, 2.13], [83, 42.2, -4.38, -2.07], None, [54, 40.7, -2.95, -1.0]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[554, 54.5, 3.01, 3.4], [81, 29.6, -7.74, -2.72], None, [43, 58.1, 1.78, 0.83]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1378, 55.2, 4.02, 6.04], [106, 38.7, -5.06, -1.62], [36, 88.9, 10.34, 2.43], [81, 55.6, 2.04, 1.03]],
-    "大盤站上20日均線 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1226, 50.5, 1.24, 2.21], None, None, None],
-    "KDJ近3日內黃金交叉 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1027, 48.3, 0.72, 1.67], [143, 39.9, -4.47, -1.59], None, [84, 52.4, 1.88, 0.06]],
-    "多方力道≥80 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[63, 50.8, 3.76, 1.56], None, None, None],
-    "KDJ近3日內死亡交叉 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[240, 55.4, 3.8, 2.59], [31, 22.6, -9.89, -5.11], None, None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1363, 52.8, 2.72, 5.87], [166, 34.9, -6.18, -2.92], None, [104, 53.8, 0.88, -0.58]],
-    "大盤站上20日均線 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2155, 51.0, 1.53, 2.76], None, [44, 81.8, 5.78, 1.61], None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1664, 54.1, 2.53, 4.06], [156, 41.0, -3.5, -3.0], [35, 80.0, 2.49, 0.1], [135, 48.9, 0.24, -0.14]],
-    "KDJ近3日內黃金交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[867, 51.6, 1.6, 1.69], [117, 44.4, -2.31, -1.09], None, [77, 42.9, -1.94, -1.73]],
-    "KDJ近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[1118, 52.2, 1.91, 4.29], [113, 36.3, -6.11, -1.0], None, [73, 52.1, 1.18, -0.13]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1186, 51.3, 1.45, 2.7], [164, 45.7, -2.35, -0.85], None, [120, 45.8, -1.09, -1.97]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[3456, 52.5, 2.58, 5.99], None, [66, 89.4, 9.92, 4.31], None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[2895, 54.3, 3.26, 6.91], [310, 39.0, -4.53, -0.6], [51, 88.2, 10.24, 1.96], [193, 49.7, 0.76, -0.47]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[3456, 52.5, 2.58, 5.99], [368, 38.0, -5.61, -1.17], [66, 89.4, 9.92, 4.31], [244, 52.0, 1.43, -0.85]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[3444, 52.6, 2.64, 6.09], [366, 38.3, -5.47, -1.09], [66, 89.4, 9.92, 4.31], [243, 52.3, 1.54, -0.83]],
-    "多方力道≥80 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1187, 54.6, 2.48, 3.09], [145, 40.7, -4.55, -1.69], None, [99, 47.5, -0.01, -0.38]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[1480, 53.2, 2.45, 3.13], [188, 41.5, -4.14, -2.34], None, [135, 45.9, -0.42, -0.7]],
-    "KDJ近3日內黃金交叉 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[1272, 55.1, 2.75, 5.58], [150, 48.7, -2.23, -1.15], None, [101, 41.6, -2.19, -2.62]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[3389, 52.8, 2.75, 6.38], [364, 38.5, -5.4, -1.04], [66, 89.4, 9.92, 4.31], [242, 52.5, 1.57, -0.81]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[2046, 52.5, 1.58, 3.61], [239, 44.8, -3.12, -1.32], None, [181, 45.9, -1.48, -3.07]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2155, 51.0, 1.53, 2.76], [267, 39.0, -4.42, -2.2], [44, 81.8, 5.78, 1.61], [200, 49.5, 0.19, -0.52]],
-    "KDJ近3日內黃金交叉 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[2042, 52.5, 1.6, 3.65], [237, 45.1, -2.89, -1.26], None, [181, 45.9, -1.48, -3.07]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[2026, 52.8, 1.67, 3.76], [237, 45.1, -2.89, -1.26], None, [180, 46.1, -1.45, -3.11]],
-    "爆量(≥1.5倍均量) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[2152, 51.1, 1.55, 2.81], [267, 39.0, -4.42, -2.2], [43, 81.4, 5.95, 1.63], [198, 50.0, 0.37, -0.48]],
-    "OBV能量潮創60日新高 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1430, 51.5, 1.29, 1.86], [190, 40.0, -4.19, -1.87], None, [121, 48.8, 0.8, -0.25]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[950, 50.5, 1.1, 1.81], [126, 41.3, -4.94, -3.36], None, [83, 47.0, -1.66, -0.79]],
-    "大盤跌破60日均線 ＋ 布林通道收窄(寬度近半年最低20%) ＋ 母子懷抱(低檔)剛形成": [None, None, None, [82, 62.2, 5.62, 2.02]],
-    "KDJ近3日內黃金交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[2046, 52.5, 1.58, 3.61], None, None, None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[2365, 54.8, 3.51, 5.45], [244, 40.6, -5.69, 0.58], [52, 94.2, 11.69, 4.58], [143, 47.6, 0.3, 0.69]],
-    "KDJ近3日內黃金交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[1744, 52.7, 1.93, 3.65], [205, 45.9, -2.63, -0.66], None, [139, 46.0, -1.27, -2.31]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[3001, 53.5, 2.96, 6.96], [330, 39.1, -5.15, -0.9], [38, 84.2, 5.44, 0.57], [210, 54.3, 2.24, 0.01]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[2125, 51.3, 1.59, 2.84], [266, 39.1, -4.35, -2.15], [42, 81.0, 5.52, 1.44], [194, 51.0, 0.48, -0.42]],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[673, 52.6, 1.97, 1.88], [77, 33.8, -6.41, -2.44], None, [69, 50.7, -1.12, -1.71]],
-    "布林通道高檔(≥80%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2138, 51.0, 1.55, 2.81], [261, 39.8, -4.04, -1.83], [44, 81.8, 5.78, 1.61], [199, 49.2, 0.03, -0.72]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1002, 46.9, 1.06, 2.29], [145, 33.1, -6.73, -2.32], None, [84, 59.5, 4.04, 1.63]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1197, 50.5, 1.26, 2.25], [159, 40.9, -4.51, -4.2], None, [118, 44.9, -2.17, -1.8]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[1611, 54.0, 2.27, 4.83], [171, 43.9, -3.31, -1.89], None, [127, 44.1, -1.15, -2.5]],
-    "KDJ近3日內死亡交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[1686, 54.8, 2.86, 4.67], None, None, None],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2832, 51.1, 1.4, 3.76], None, [49, 83.7, 4.73, 1.14], None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[3281, 52.5, 2.63, 6.34], [339, 37.2, -5.87, -1.76], [66, 89.4, 9.92, 4.31], [218, 51.8, 1.0, -0.55]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1842, 52.4, 1.95, 2.95], [233, 40.8, -3.69, -2.18], [40, 80.0, 4.93, 0.75], [162, 50.0, 0.96, -0.13]],
-    "KDJ近3日內黃金交叉 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[1742, 54.3, 2.23, 3.46], [199, 47.2, -2.11, -1.46], None, [146, 46.6, -1.95, -3.11]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[3456, 52.5, 2.58, 5.99], [368, 38.0, -5.61, -1.17], None, None],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1781, 51.2, 1.38, 3.05], [229, 39.7, -4.54, -3.07], [31, 80.6, 4.8, 1.35], [167, 47.9, -0.54, -1.41]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[860, 52.6, 2.07, 1.92], [110, 43.6, -4.09, -3.64], None, [80, 40.0, -2.6, -1.45]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1032, 51.9, 1.51, 2.24], [140, 42.9, -3.75, -3.41], None, [97, 45.4, -1.48, -1.1]],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3238, 50.6, 1.27, 2.62], None, [69, 78.3, 4.76, 1.59], None],
-    "多方力道≥65 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[973, 51.1, 1.25, 1.98], [126, 40.5, -4.69, -3.42], None, [87, 47.1, -1.91, -0.88]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[972, 52.4, 1.21, 2.5], [126, 46.8, -2.17, -1.2], None, [89, 44.9, -2.66, -2.54]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%)": [[1300, 56.9, 3.7, 5.71], [134, 41.0, -4.64, -1.77], None, [92, 52.2, -0.23, -0.04]],
-    "KDJ近3日內黃金交叉 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[1956, 52.2, 1.42, 2.75], [233, 45.5, -2.84, -1.31], None, [174, 46.0, -1.43, -3.04]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1226, 50.5, 1.24, 2.21], [161, 41.0, -4.52, -4.15], None, [120, 45.0, -2.1, -1.84]],
-    "爆量(≥2倍均量) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[1224, 50.5, 1.25, 2.31], [161, 41.0, -4.52, -4.15], None, [118, 45.8, -1.84, -1.53]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[1207, 51.0, 1.33, 2.34], [160, 41.2, -4.41, -4.1], None, [117, 46.2, -1.73, -1.52]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 強勢突破盤 ＋ 短線過熱(高於月線≥20%)": [[1847, 53.1, 2.9, 6.33], [192, 32.3, -6.27, -1.22], [42, 88.1, 7.15, 3.18], [125, 52.0, 0.63, 0.34]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[484, 56.4, 4.03, 4.24], [39, 43.6, -2.92, -0.81], None, [32, 34.4, -4.53, -1.5]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2164, 54.3, 2.35, 4.62], [216, 42.6, -3.86, -4.56], [39, 87.2, 3.68, 0.2], [175, 49.7, -0.1, -0.69]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1133, 50.6, 1.18, 2.34], [156, 41.0, -4.56, -4.36], None, [111, 45.0, -2.48, -1.96]],
-    "多方力道≥65 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1776, 51.5, 1.57, 2.71], [219, 39.3, -4.21, -1.67], None, [152, 50.7, 0.53, 0.08]],
-    "MACD近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[383, 41.3, -1.68, -1.28], [51, 37.3, -7.3, -2.54], None, None],
-    "KDJ近3日內死亡交叉 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[867, 54.1, 3.0, 5.02], [132, 31.8, -8.58, -2.43], None, [72, 62.5, 3.91, 1.1]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1942, 50.4, 1.22, 2.41], [249, 39.8, -4.22, -2.01], [42, 81.0, 5.21, 1.57], [186, 50.0, -0.03, -0.74]],
-    "多方力道≥80 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 近5日跌幅≥8%(短線超跌)": [[232, 54.7, 1.67, 2.09], [70, 55.7, -1.31, -0.74], None, [45, 55.6, 1.41, -0.47]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[729, 53.2, 2.44, 3.53], [102, 36.3, -5.13, -1.74], None, [70, 52.9, 2.09, 0.44]],
-    "OBV能量潮創60日新高 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[880, 52.5, 1.29, 1.93], [121, 42.1, -3.87, -2.13], None, [83, 47.0, -1.24, -1.11]],
-    "KDJ近3日內黃金交叉 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[541, 51.0, 1.61, 1.06], [69, 49.3, -2.57, -1.27], None, [54, 38.9, -4.18, -2.62]],
-    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1593, 51.7, 1.43, 2.47], [208, 43.3, -3.83, -2.59], None, [135, 48.9, 0.52, -0.23]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2463, 53.5, 2.26, 4.04], [244, 42.6, -2.89, -3.11], [49, 79.6, 2.53, 0.27], [222, 50.9, 1.75, -0.54]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[541, 44.0, 0.24, 0.33], [82, 35.4, -7.34, -4.41], None, [53, 52.8, 0.28, -0.07]],
-    "母子懷抱(高檔)剛形成 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[71, 50.7, 2.79, 1.36], None, None, None],
-    "大盤站上60日均線 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[88, 53.4, 2.81, 1.41], None, None, None],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1585, 50.7, 1.77, 3.66], [201, 36.8, -4.58, -0.91], [37, 86.5, 8.23, 0.96], [157, 51.0, 1.09, -1.16]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[2173, 55.5, 3.42, 7.24], [231, 44.2, -3.87, -0.08], None, [154, 53.9, 2.52, -0.19]],
-    "布林通道高檔(≥80%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1221, 50.5, 1.28, 2.28], [158, 41.8, -4.12, -3.83], None, [120, 45.0, -2.1, -1.84]],
-    "OBV能量潮創60日新高 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[1740, 52.8, 2.79, 5.11], [188, 37.2, -5.44, -1.48], [42, 90.5, 12.18, 4.3], [101, 53.5, 2.05, 1.47]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[985, 51.5, 1.36, 2.36], [136, 44.1, -3.97, -3.64], None, [93, 45.2, -2.32, -1.57]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[3015, 52.7, 2.59, 6.2], [334, 38.9, -5.56, -0.77], [42, 83.3, 5.92, 0.1], [214, 53.7, 2.15, -0.26]],
-    "KDJ近3日內黃金交叉 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[2046, 52.5, 1.58, 3.61], [239, 44.8, -3.12, -1.32], None, None],
-    "KDJ近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[1747, 52.0, 1.66, 3.75], [218, 44.0, -3.04, -1.12], None, [141, 45.4, -1.14, -2.54]],
-    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2832, 51.1, 1.4, 3.76], [355, 40.6, -4.58, -3.89], [49, 83.7, 4.73, 1.14], [260, 47.7, -0.86, -2.29]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2827, 51.1, 1.42, 3.8], [355, 40.6, -4.58, -3.89], [49, 83.7, 4.73, 1.14], [258, 48.1, -0.74, -2.2]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近20日強於大盤≥10%": [[150, 42.7, -2.5, -0.75], [36, 58.3, 1.12, -0.33], None, None],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2811, 51.2, 1.44, 4.0], [346, 41.6, -4.16, -3.37], [49, 83.7, 4.73, 1.14], [257, 47.5, -0.98, -2.1]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1531, 51.3, 1.4, 2.52], [190, 44.2, -3.76, -2.59], None, [137, 45.3, -1.36, -1.26]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1702, 50.9, 1.44, 2.85], [218, 38.1, -5.17, -2.53], None, [139, 51.8, 0.91, -0.0]],
-    "大盤站上60日均線 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1226, 50.5, 1.24, 2.21], [161, 41.0, -4.52, -4.15], None, None],
-    "KDJ近3日內黃金交叉 ＋ 強勢突破盤 ＋ 短線過熱(高於月線≥20%)": [[1192, 52.5, 1.18, 1.96], [151, 45.7, -2.74, -0.76], None, [112, 42.0, -1.28, -2.37]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3225, 50.7, 1.31, 2.65], [396, 41.2, -3.72, -2.34], [68, 77.9, 4.85, 1.62], [337, 48.7, 0.34, -2.52]],
-    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1890, 51.8, 1.34, 2.02], [239, 40.2, -4.11, -2.01], [42, 73.8, 5.34, 1.5], [167, 48.5, 0.47, -0.05]],
-    "回後買上漲全通過 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[1306, 52.5, 2.05, 2.81], [137, 38.0, -4.6, -2.13], None, [122, 47.5, -0.03, -1.66]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[299, 49.5, 0.68, 1.14], [44, 38.6, -5.35, -1.5], None, [30, 50.0, -2.7, -0.96]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1673, 54.4, 2.44, 3.29], [211, 46.0, -3.0, -2.17], None, [137, 46.0, -0.59, -0.81]],
-    "回後買上漲全通過 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[425, 52.9, 2.22, 1.8], [51, 37.3, -4.73, -2.22], None, [45, 35.6, -4.45, -2.35]],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2423, 51.8, 1.72, 3.98], [300, 42.0, -4.18, -3.47], [31, 80.6, 2.35, 0.56], [207, 49.3, -0.46, -1.4]],
-    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2786, 51.4, 1.5, 3.82], [353, 40.8, -4.49, -3.87], [48, 83.3, 4.33, 0.92], [254, 48.8, -0.64, -2.14]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2002, 53.1, 2.23, 3.86], [252, 44.4, -4.29, -3.03], [35, 91.4, 6.82, 1.91], [173, 43.4, -1.68, -2.24]],
-    "短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3238, 50.6, 1.27, 2.62], [398, 41.0, -3.85, -2.4], [69, 78.3, 4.76, 1.59], [339, 48.4, 0.24, -2.6]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 母子懷抱(高檔)剛形成 ＋ 漲時量≥跌時量1.5倍(近20日)": [[157, 54.1, 2.9, 1.84], None, None, None],
-    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 量能區間高檔(≥90百分位)": [[3190, 50.9, 1.37, 2.74], [395, 41.3, -3.67, -2.28], [67, 77.6, 4.57, 1.41], [332, 49.4, 0.45, -2.46]],
-    "短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口 ＋ 量能區間高檔(≥90百分位)": [[1757, 51.6, 1.81, 3.87], [169, 47.9, -1.59, -1.1], [48, 85.4, 9.04, 2.35], [186, 48.9, -0.17, -0.68]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1288, 47.3, 0.91, 2.2], [156, 35.9, -6.39, -2.4], None, [95, 49.5, -1.16, -0.94]],
-    "回後買上漲全通過 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[1541, 51.3, 1.57, 2.4], None, None, None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [[221, 41.6, -0.73, -1.01], [65, 36.9, -5.21, -1.56], None, [44, 56.8, 3.34, 0.63]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[193, 47.2, 0.15, 0.58], [52, 48.1, -4.66, -0.83], None, [54, 57.4, 2.56, 1.42]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[1146, 57.9, 4.27, 6.16], [133, 39.8, -5.21, -1.57], None, [88, 51.1, -0.86, -0.55]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2413, 52.4, 1.86, 3.87], [306, 42.2, -3.56, -2.92], [43, 83.7, 4.96, 0.99], [212, 47.2, -0.63, -1.5]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[758, 49.5, 1.41, 0.97], [108, 32.4, -7.28, -1.58], None, [70, 61.4, 4.04, 2.06]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%)": [[1686, 54.8, 2.86, 4.67], [197, 36.5, -6.26, -2.12], None, [135, 51.9, 0.13, -0.73]],
-    "KDJ近3日內死亡交叉 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[1685, 54.8, 2.88, 4.69], [197, 36.5, -6.26, -2.12], None, [134, 52.2, 0.31, -0.71]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[1679, 54.9, 2.86, 4.71], [197, 36.5, -6.26, -2.12], None, [134, 52.2, 0.31, -0.71]],
-    "KDJ近3日內死亡交叉 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[1507, 55.1, 2.94, 5.08], [176, 36.9, -5.67, -1.39], None, [104, 50.0, -0.58, 0.01]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2792, 51.9, 1.75, 3.51], [345, 42.3, -3.07, -2.18], [57, 78.9, 5.5, 0.69], [271, 48.7, 0.27, -2.29]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1307, 46.8, 0.57, 2.91], [179, 34.1, -7.2, -3.34], None, [106, 54.7, 1.05, -0.33]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2717, 50.6, 1.44, 2.78], [341, 40.2, -4.13, -2.35], [42, 71.4, 1.32, -0.31], [259, 50.2, 1.06, -1.82]],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2841, 50.7, 1.12, 3.19], None, [58, 93.1, 6.21, 2.56], None],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[662, 52.4, 2.01, 1.49], [71, 39.4, -5.93, -3.02], None, [64, 43.8, -2.93, -3.02]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1278, 51.7, 1.72, 2.39], [119, 36.1, -6.0, -3.34], None, [110, 49.1, -0.15, -1.4]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[84, 52.4, 2.62, 1.24], None, None, None],
-    "多方力道≥65 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[83, 55.4, 4.02, 2.03], None, None, None],
-    "大盤站上20日均線 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[88, 53.4, 2.81, 1.41], None, None, None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成": [[132, 41.7, -2.45, -1.16], None, None, None],
-    "KDJ近3日內死亡交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[1570, 55.4, 3.06, 5.07], [185, 37.8, -6.05, -1.83], None, [119, 54.6, 0.82, -0.36]],
-    "大盤站上60日均線 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2155, 51.0, 1.53, 2.76], [267, 39.0, -4.42, -2.2], None, None],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[3315, 49.3, 1.45, 3.89], None, [67, 88.1, 8.09, 2.25], None],
-    "KDJ近3日內死亡交叉 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[1298, 56.8, 3.42, 5.29], [157, 38.9, -5.69, -2.12], None, [105, 53.3, 0.42, -0.43]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2068, 54.0, 2.44, 3.78], [253, 42.3, -3.2, -1.07], None, [200, 49.0, 1.71, -0.99]],
-    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 量能區間高檔(≥90百分位)": [[2116, 50.4, 0.98, 2.96], [274, 40.5, -4.28, -3.82], [41, 80.5, 4.97, 1.18], [216, 46.3, -1.29, -2.32]],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2779, 51.4, 1.55, 2.78], [343, 41.4, -3.46, -2.12], [45, 73.3, 1.29, 0.55], [277, 49.8, 0.95, -1.71]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[5190, 53.6, 2.29, 6.17], None, [104, 81.7, 5.21, 5.55], None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥80 ＋ 近5日跌幅≥8%(短線超跌)": [[271, 51.7, 1.4, 1.91], [84, 65.5, 0.93, 0.09], None, [54, 51.9, 1.23, -0.13]],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[878, 51.0, 1.44, 1.15], [111, 36.9, -5.12, -2.46], None, [103, 49.5, 0.82, -0.32]],
-    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[4454, 54.5, 2.48, 5.88], None, [43, 74.4, 0.96, 0.23], None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2123, 53.0, 2.0, 4.31], [205, 44.9, -2.79, -3.55], [48, 95.8, 5.59, 2.26], [154, 46.8, -0.95, -0.92]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 量能區間高檔(≥90百分位)": [[2202, 53.4, 2.32, 3.88], [277, 43.3, -3.28, -1.43], [50, 86.0, 6.71, 2.11], [223, 44.4, -0.24, -1.28]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3087, 50.4, 1.14, 2.53], [379, 41.7, -3.64, -2.39], [69, 78.3, 4.76, 1.59], [317, 47.0, -0.43, -2.27]],
-    "OBV能量潮創60日新高 ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1011, 51.4, 1.33, 2.66], [114, 37.7, -4.02, -1.59], None, [96, 45.8, -0.08, -0.96]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近5日跌幅≥8%(短線超跌)": [[515, 49.7, 0.75, 0.52], [156, 60.3, 0.69, 1.26], None, [137, 61.3, 4.21, 0.25]],
-    "KDJ近3日內死亡交叉 ＋ KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[689, 55.9, 2.82, 3.98], [87, 40.2, -4.71, -1.43], None, [50, 44.0, -1.7, -0.55]],
-    "KDJ近3日內死亡交叉 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[1484, 56.5, 3.24, 4.62], [173, 34.1, -6.6, -2.46], None, [113, 53.1, -0.52, -1.16]],
-    "KDJ近3日內死亡交叉 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[1686, 54.8, 2.86, 4.67], [197, 36.5, -6.26, -2.12], None, None],
-    "KDJ近3日內死亡交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[1531, 55.3, 3.09, 5.1], [190, 36.3, -6.39, -1.93], None, [112, 52.7, 0.45, -0.75]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[2491, 51.0, 1.87, 4.6], [242, 36.0, -5.9, -2.67], [47, 87.2, 7.2, 4.2], [189, 54.0, 2.63, 0.27]],
-    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2207, 50.7, 1.13, 3.23], [275, 43.6, -3.47, -2.91], [41, 90.2, 6.22, 2.18], [197, 44.2, -1.79, -2.25]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2293, 50.8, 1.32, 3.25], [298, 40.6, -4.84, -3.58], None, [175, 49.1, -0.52, -1.54]],
-    "創52週新高 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[708, 50.6, 1.69, 2.35], [86, 43.0, -4.04, -2.56], None, [62, 54.8, -0.22, -0.31]],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[6796, 51.7, 1.59, 4.39], None, [141, 82.3, 5.67, 1.53], None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%)": [[5190, 53.6, 2.29, 6.17], [478, 42.9, -3.11, -3.28], [104, 81.7, 5.21, 5.55], [394, 50.0, 0.27, -1.88]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[3680, 55.5, 2.92, 6.88], [343, 45.8, -2.15, -3.17], [31, 77.4, 1.59, 1.18], [269, 50.6, 1.0, -1.36]],
-    "大盤站上20日均線 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[6776, 51.8, 1.62, 4.45], None, [140, 82.1, 5.72, 1.54], None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5187, 53.6, 2.29, 6.17], [478, 42.9, -3.11, -3.28], [103, 81.6, 5.28, 5.58], [394, 50.0, 0.27, -1.88]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[6776, 51.8, 1.62, 4.45], [722, 41.6, -3.98, -3.06], [140, 82.1, 5.72, 1.54], [566, 48.4, -0.29, -4.02]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[5725, 51.8, 1.75, 4.6], None, [73, 78.1, 3.6, 0.74], None],
-    "布林通道收窄(寬度近半年最低20%) ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [[360, 49.7, 0.55, -0.13], [83, 42.2, -2.92, -1.6], None, [138, 63.8, 3.76, 1.05]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[73, 52.1, 1.5, 0.7], None, None, None],
-    "KDJ近3日內黃金交叉 ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[742, 51.9, 1.51, 1.52], [104, 40.4, -4.71, -1.71], None, [65, 46.2, -1.16, -0.53]],
-    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[1169, 53.6, 2.62, 2.99], [152, 43.4, -3.86, -2.22], None, [110, 46.4, -0.28, 0.09]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[670, 48.1, 0.19, 1.34], [74, 35.1, -4.51, -2.11], None, [65, 56.9, -1.16, -1.24]],
-    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3238, 50.6, 1.27, 2.62], [398, 41.0, -3.85, -2.4], None, None],
-    "多方力道≥65 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[5974, 52.4, 1.86, 4.97], None, [79, 79.7, 3.72, 1.67], None],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[6700, 52.0, 1.69, 4.6], None, [139, 82.0, 5.59, 1.43], None],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[5157, 53.7, 2.34, 6.26], [478, 42.9, -3.11, -3.28], [102, 81.4, 5.09, 5.64], [393, 50.1, 0.31, -1.86]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[4659, 54.5, 2.62, 6.49], [423, 43.7, -2.26, -2.81], [82, 85.4, 5.96, 5.62], [339, 48.4, -0.54, -2.31]],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2765, 52.7, 2.19, 4.0], None, [69, 87.0, 7.91, 2.75], None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2130, 52.4, 2.4, 4.19], [180, 47.8, -2.8, -0.89], [32, 81.2, 7.77, 1.07], [163, 47.2, -0.89, -0.34]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2041, 54.8, 3.07, 5.29], [127, 52.0, -1.3, -1.03], [47, 87.2, 6.0, 2.33], [160, 48.1, -1.09, -0.62]],
-    "短線過熱(高於月線≥20%)": [[6796, 51.7, 1.59, 4.39], [724, 41.4, -4.06, -3.11], [141, 82.3, 5.67, 1.53], [568, 48.2, -0.35, -4.05]],
-    "大盤站上20日均線 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[6437, 51.5, 1.47, 4.01], None, [139, 82.7, 5.87, 3.44], None],
-    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 短線過熱(高於月線≥20%)": [[1017, 53.8, 2.16, 2.7], [121, 40.5, -4.9, -1.72], None, [75, 53.3, 0.3, -0.27]],
-    "大盤站上20日均線 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[6796, 51.7, 1.59, 4.39], None, None, None],
-    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4749, 53.9, 2.4, 4.7], None, [101, 91.1, 8.41, 5.49], None],
-    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[6700, 52.0, 1.69, 4.6], [720, 41.7, -3.94, -3.03], [139, 82.0, 5.59, 1.43], [561, 48.8, -0.23, -3.99]],
-    "母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[86, 54.7, 3.3, 1.63], None, None, None],
-    "母子懷抱(高檔)剛形成 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[87, 54.0, 2.93, 1.46], None, None, None],
-    "母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[88, 53.4, 2.81, 1.41], None, None, None],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 近20日強於大盤≥10% ＋ 近5日跌幅≥8%(短線超跌)": [[719, 44.1, -1.22, -0.42], [228, 57.0, 0.53, 0.9], None, [330, 61.8, 2.88, 1.22]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[689, 49.1, 0.25, 1.93], [87, 31.0, -5.2, -2.01], None, [68, 54.4, 0.1, -0.18]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1079, 53.8, 2.09, 3.02], [92, 58.7, 1.09, 1.37], None, [100, 40.0, -3.39, -3.82]],
-    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 近5日跌幅≥8%(短線超跌)": [[325, 52.3, 0.87, 1.46], [101, 64.4, 0.78, -0.0], None, None],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[504, 51.4, 1.02, 1.43], [55, 43.6, -3.99, -1.33], None, [40, 55.0, 0.84, 0.28]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[3260, 49.7, 1.61, 4.17], [404, 36.6, -6.12, -1.83], [66, 87.9, 7.85, 2.08], [272, 53.7, 1.68, -1.83]],
-    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1514, 50.5, 1.01, 1.78], [178, 46.6, -3.28, -1.69], None, [122, 44.3, -0.65, -0.71]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[2767, 51.3, 2.1, 5.26], [343, 37.3, -5.54, -1.72], [47, 87.2, 7.81, 1.55], [225, 51.1, 1.08, -1.73]],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1541, 51.3, 1.57, 2.4], [167, 34.7, -6.05, -2.56], None, [141, 48.2, -0.03, -1.47]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[4750, 53.7, 2.35, 6.19], [440, 43.2, -2.95, -3.3], [58, 79.3, 3.26, 2.08], [338, 51.5, 1.06, -1.03]],
-    "回後買上漲全通過 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[1537, 51.3, 1.57, 2.52], [167, 34.7, -6.05, -2.56], None, [140, 47.9, -0.29, -1.66]],
-    "回後買上漲全通過 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[1538, 51.4, 1.57, 2.39], [167, 34.7, -6.05, -2.56], None, [141, 48.2, -0.03, -1.47]],
-    "大盤站上20日均線 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[5795, 53.2, 2.13, 5.32], None, [104, 83.7, 6.12, 1.5], None],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2227, 53.7, 2.64, 4.81], [173, 49.1, -1.58, -0.79], [31, 83.9, 6.39, 2.48], [184, 48.4, -0.72, -0.47]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 距52週高點≤5%": [[1130, 53.5, 2.21, 3.2], [132, 43.9, -4.16, -1.2], None, [84, 51.2, 0.84, -0.88]],
-    "短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2841, 50.7, 1.12, 3.19], [328, 43.0, -3.73, -3.51], [58, 93.1, 6.21, 2.56], [239, 44.4, -1.86, -3.33]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[4264, 54.3, 2.52, 6.23], [457, 44.6, -3.25, -2.54], [38, 71.1, -0.15, 0.21], [313, 49.5, 1.04, -2.17]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[4928, 53.2, 2.09, 5.53], [445, 42.5, -3.22, -4.36], [103, 81.6, 5.13, 5.38], [364, 49.7, -0.1, -1.61]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2829, 50.8, 1.16, 3.24], [328, 43.0, -3.73, -3.51], [58, 93.1, 6.21, 2.56], [238, 44.5, -1.77, -3.27]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2752, 52.9, 2.25, 4.04], [223, 47.5, -2.4, -0.89], [68, 86.8, 8.05, 2.81], [232, 47.8, -1.02, -1.23]],
-    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 近3日向上跳空缺口": [[2712, 53.2, 2.38, 4.09], [222, 47.7, -2.32, -0.83], [67, 86.6, 7.81, 2.61], [228, 48.7, -0.95, -1.23]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4048, 56.0, 3.12, 5.82], [406, 45.3, -2.38, -1.9], [77, 88.3, 7.51, 4.49], [303, 48.5, -0.21, -2.01]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[3708, 55.9, 3.2, 6.63], [324, 45.7, -2.35, -2.11], [75, 92.0, 8.16, 4.83], [253, 47.0, -0.93, -1.84]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[4570, 53.2, 2.2, 5.71], [439, 42.1, -3.38, -3.25], [54, 79.6, 3.6, 1.62], [315, 50.8, 0.89, -1.09]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": [[2696, 53.0, 2.07, 4.61], [243, 44.0, -2.73, -1.51], [53, 81.1, 7.36, 4.01], [187, 47.6, -0.1, -0.59]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[6437, 51.5, 1.47, 4.01], [678, 41.3, -4.07, -3.02], [139, 82.7, 5.87, 3.44], [515, 47.4, -0.73, -3.62]],
-    "短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2765, 52.7, 2.19, 4.0], [223, 47.5, -2.4, -0.89], [69, 87.0, 7.91, 2.75], [234, 47.4, -1.16, -1.32]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[5368, 52.3, 1.93, 4.96], [594, 41.9, -3.92, -2.87], [59, 74.6, 0.98, 0.29], [398, 50.0, 0.76, -2.44]],
-    "多方力道≥80 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[4119, 55.1, 2.75, 6.14], [433, 44.1, -2.9, -2.27], [36, 69.4, -0.08, -0.29], [301, 46.8, -0.12, -2.94]],
-    "布林通道高檔(≥80%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[6419, 51.6, 1.49, 4.07], [677, 41.4, -4.03, -2.99], [138, 82.6, 5.92, 3.46], [513, 47.6, -0.67, -3.55]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2748, 52.6, 2.16, 4.05], [223, 47.5, -2.4, -0.89], [69, 87.0, 7.91, 2.75], [231, 46.8, -1.43, -1.43]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 近20日強於大盤≥10%": [[4694, 54.3, 2.51, 4.81], [486, 45.1, -3.23, -1.35], [100, 91.0, 8.51, 5.52], [356, 46.6, -0.75, -2.99]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[5725, 51.8, 1.75, 4.6], [639, 41.2, -4.26, -3.14], [73, 78.1, 3.6, 0.74], [436, 50.0, 0.5, -2.99]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[6345, 51.8, 1.57, 4.23], [675, 41.5, -3.98, -2.97], [137, 82.5, 5.79, 3.35], [508, 48.0, -0.61, -3.53]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5720, 51.9, 1.77, 4.64], [639, 41.2, -4.26, -3.14], [73, 78.1, 3.6, 0.74], [436, 50.0, 0.5, -2.99]],
-    "回後買上漲全通過 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[1541, 51.3, 1.57, 2.4], [167, 34.7, -6.05, -2.56], None, None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4028, 54.4, 2.71, 4.56], [440, 43.9, -3.59, -1.94], [50, 86.0, 6.43, 1.54], [290, 46.9, -0.26, -2.3]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近1季財報EPS大幅優於預期(≥10%)": [[179, 43.0, -1.29, -0.49], [46, 60.9, 2.02, -0.68], None, [44, 72.7, 10.11, 1.49]],
-    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[942, 51.0, 1.48, 2.82], [100, 48.0, -2.42, -2.67], None, [94, 45.7, -2.42, -2.37]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[3315, 49.3, 1.45, 3.89], [406, 36.5, -6.19, -1.89], [67, 88.1, 8.09, 2.25], [273, 53.5, 1.58, -1.84]],
-    "KDJ近3日內死亡交叉 ＋ 創52週新高 ＋ 短線過熱(高於月線≥20%)": [[532, 57.5, 4.0, 4.7], [68, 35.3, -6.61, -2.16], None, [32, 50.0, 0.12, 0.37]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[3307, 49.4, 1.49, 3.96], [406, 36.5, -6.19, -1.89], [67, 88.1, 8.09, 2.25], [272, 53.7, 1.68, -1.83]],
-    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2832, 51.1, 1.4, 3.76], [355, 40.6, -4.58, -3.89], None, None],
-    "MACD近3日內黃金交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[616, 40.7, -2.27, -2.35], None, None, None],
-    "回後買上漲全通過 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[1302, 50.6, 1.34, 2.31], [148, 34.5, -5.77, -1.98], None, [112, 50.9, 0.74, -0.98]],
-    "多方力道≥80 ＋ 近20日強於大盤≥10% ＋ 近5日跌幅≥8%(短線超跌)": [[294, 54.4, 1.48, 1.89], [97, 63.9, 0.76, -0.37], None, [67, 49.3, 0.09, -1.28]],
-    "回後買上漲全通過 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[931, 53.1, 2.37, 2.77], [98, 36.7, -5.09, -1.95], None, [87, 47.1, -0.14, -1.61]],
-    "短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1890, 50.3, 0.87, 2.36], [240, 44.2, -3.56, -2.94], [38, 89.5, 7.09, 2.6], [187, 43.3, -2.52, -2.86]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[5190, 53.6, 2.29, 6.17], [478, 42.9, -3.11, -3.28], None, None],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[5974, 52.4, 1.86, 4.97], [650, 42.0, -3.81, -2.89], [79, 79.7, 3.72, 1.67], [470, 49.6, 0.25, -2.99]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[5795, 53.2, 2.13, 5.32], [622, 42.1, -3.27, -2.55], [104, 83.7, 6.12, 1.5], [465, 48.2, -0.55, -3.85]],
-    "MACD近3日內黃金交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[423, 43.5, -1.16, -1.29], [54, 53.7, -0.57, 0.32], None, [45, 44.4, -1.57, -0.56]],
-    "多方力道≥65 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5970, 52.4, 1.87, 4.98], [650, 42.0, -3.81, -2.89], [79, 79.7, 3.72, 1.67], [469, 49.7, 0.27, -2.98]],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[5942, 52.4, 1.87, 4.99], [649, 42.1, -3.79, -2.88], [78, 79.5, 3.46, 1.57], [466, 50.0, 0.31, -2.96]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5792, 53.3, 2.14, 5.36], [622, 42.1, -3.27, -2.55], [104, 83.7, 6.12, 1.5], [465, 48.2, -0.55, -3.85]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[5775, 53.3, 2.18, 5.45], [622, 42.1, -3.27, -2.55], [103, 83.5, 5.94, 1.39], [465, 48.2, -0.55, -3.85]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[4454, 54.5, 2.48, 5.88], [481, 44.7, -3.23, -2.64], [43, 74.4, 0.96, 0.23], [352, 48.3, 0.54, -2.78]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4749, 53.9, 2.4, 4.7], [488, 44.9, -3.29, -1.42], [101, 91.1, 8.41, 5.49], [362, 45.9, -0.88, -3.07]],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4173, 54.9, 2.84, 5.69], [440, 44.5, -3.23, -1.36], [52, 84.6, 5.09, 2.4], [307, 46.3, -0.31, -2.17]],
-    "多方力道≥80 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[4454, 54.5, 2.48, 5.88], [481, 44.7, -3.23, -2.64], [43, 74.4, 0.96, 0.23], [351, 48.4, 0.57, -2.76]],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[4449, 54.5, 2.48, 5.89], [481, 44.7, -3.23, -2.64], [43, 74.4, 0.96, 0.23], [349, 48.7, 0.57, -2.75]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4741, 54.0, 2.41, 4.7], [488, 44.9, -3.29, -1.42], [100, 91.0, 8.51, 5.52], [360, 46.1, -0.79, -3.02]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[5689, 51.9, 1.81, 4.75], [639, 41.2, -4.26, -3.14], [73, 78.1, 3.6, 0.74], [436, 50.0, 0.5, -2.99]],
-    "均線多頭排列(5>20>60且站上月線) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[5080, 52.9, 2.12, 5.37], [557, 41.5, -3.58, -2.48], [59, 76.3, 2.95, 0.04], [370, 48.1, -0.19, -3.19]],
-    "OBV能量潮創60日新高 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[2265, 54.3, 2.57, 4.92], [227, 43.6, -3.1, -1.44], None, [154, 44.2, -0.48, -1.74]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近1季財報EPS低於預期": [[83, 41.0, -1.56, -0.37], None, None, None],
-    "布林通道高檔(≥80%) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[76, 56.6, 3.77, 1.68], None, None, None],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1269, 49.8, 2.19, 3.13], [109, 41.3, -4.29, -1.48], [37, 89.2, 10.72, 3.44], [100, 53.0, 1.61, 0.53]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[1433, 53.5, 1.95, 2.74], [171, 46.8, -2.55, -0.27], None, [126, 44.4, -1.82, -2.66]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ MACD近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[375, 43.7, -1.28, -0.99], [53, 50.9, -2.17, -0.36], None, [32, 50.0, -0.07, -0.61]],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[3128, 49.0, 1.29, 3.52], [372, 36.3, -6.16, -1.35], [65, 89.2, 8.6, 4.04], [240, 53.8, 1.25, -1.32]],
-    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[791, 52.1, 1.33, 1.88], [112, 50.9, -1.67, -1.5], None, [69, 40.6, -3.57, -2.51]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 近3日向上跳空缺口": [[2025, 54.2, 2.83, 4.29], [157, 49.7, -2.23, -1.15], [49, 93.9, 9.34, 3.51], [160, 45.0, -2.41, -1.89]],
-    "多方力道≥65 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[5271, 53.4, 2.24, 5.51], [570, 41.8, -3.36, -2.53], [65, 76.9, 3.43, 0.55], [399, 48.6, -0.08, -3.16]],
-    "OBV能量潮創60日新高 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[3320, 51.8, 1.59, 3.64], None, [68, 79.4, 7.5, 2.26], None],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[737, 53.9, 2.74, 3.65], [51, 41.2, -2.61, -1.03], None, [68, 42.6, -2.8, -1.84]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[1221, 48.6, -0.05, 1.03], [127, 32.3, -6.46, -4.4], None, [91, 61.5, 4.02, 1.86]],
-    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[6796, 51.7, 1.59, 4.39], [724, 41.4, -4.06, -3.11], None, None],
-    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2392, 51.5, 1.42, 3.68], [275, 44.0, -3.46, -2.86], [33, 93.9, 5.49, 2.27], [192, 45.8, -1.39, -2.19]],
-    "多方力道≥65 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[5974, 52.4, 1.86, 4.97], [650, 42.0, -3.81, -2.89], None, None],
-    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1626, 54.3, 2.12, 3.45], [192, 45.8, -3.04, -2.07], None, [122, 43.4, -1.02, -0.96]],
-    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[4454, 54.5, 2.48, 5.88], [481, 44.7, -3.23, -2.64], None, None],
-    "大盤站上60日均線 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[6776, 51.8, 1.62, 4.45], [722, 41.6, -3.98, -3.06], None, None],
-    "多方力道≥65 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[5625, 52.1, 1.72, 4.56], [606, 41.7, -3.89, -2.39], [77, 80.5, 4.03, 2.68], [421, 48.9, -0.12, -2.64]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4533, 53.7, 2.29, 3.98], [457, 45.1, -3.23, -1.81], [100, 91.0, 8.36, 5.47], [339, 45.1, -1.36, -3.28]],
-    "OBV能量潮創60日新高 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[3290, 51.9, 1.63, 3.66], [364, 41.8, -3.86, -2.18], [67, 80.6, 8.07, 4.97], [245, 48.6, 0.5, -0.84]],
-    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 距52週高點≤5%": [[642, 60.0, 4.05, 5.5], [74, 37.8, -4.6, -1.4], None, [39, 53.8, 0.63, 0.6]],
-    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[1707, 48.1, 0.12, 1.32], [191, 33.5, -6.24, -4.03], [35, 57.1, -2.57, -1.21], [147, 56.5, 1.34, -0.79]],
-    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[6700, 52.0, 1.69, 4.6], [720, 41.7, -3.94, -3.03], None, None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[5725, 51.8, 1.75, 4.6], [639, 41.2, -4.26, -3.14], None, None],
-    "半年強勢(6-1月勝大盤≥10%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 近5日跌幅≥8%(短線超跌)": [[773, 44.0, -1.08, -1.23], [224, 60.3, 1.54, 1.28], None, [267, 61.0, 2.83, 0.54]],
-    "OBV能量潮創60日新高 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[3151, 52.2, 1.73, 3.84], [350, 42.3, -3.75, -2.23], [62, 79.0, 6.82, 1.93], [236, 47.5, 0.03, -1.64]],
-    "OBV能量潮創60日新高 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[2971, 51.8, 1.71, 3.9], [327, 41.6, -3.43, -1.94], [45, 68.9, 2.11, 0.61], [214, 47.2, 0.39, -1.21]],
-    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4749, 53.9, 2.4, 4.7], [488, 44.9, -3.29, -1.42], None, None],
-    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 近5日跌幅≥8%(短線超跌)": [[325, 52.3, 0.87, 1.46], None, None, None],
-    "均線多頭排列(5>20>60且站上月線) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[5375, 51.5, 1.6, 4.12], [594, 40.9, -4.33, -3.1], [72, 79.2, 4.07, 1.74], [388, 49.7, 0.2, -2.48]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2024, 52.9, 1.84, 3.17], [243, 46.1, -3.44, -2.12], [42, 100.0, 7.76, 3.72], [156, 37.2, -2.96, -3.16]],
-    "大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成 ＋ 近3日向上跳空缺口": [None, None, None, [112, 73.2, 7.61, 2.08]],
-    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[1522, 51.6, 1.66, 2.52], [167, 34.7, -6.05, -2.56], None, [139, 48.9, 0.03, -1.43]],
-    "MACD近3日內黃金交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[384, 42.7, -1.54, -1.66], [62, 45.2, -4.37, -1.53], None, [43, 55.8, 0.46, -0.26]],
-    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2822, 50.9, 1.19, 3.38], [323, 43.3, -3.63, -3.35], [58, 93.1, 6.21, 2.56], [238, 44.5, -1.81, -3.23]],
-    "OBV能量潮創60日新高 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[3314, 51.8, 1.58, 3.67], [366, 41.8, -3.82, -2.22], [68, 79.4, 7.5, 2.26], [247, 48.2, 0.26, -1.28]],
-    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2786, 51.0, 1.25, 3.35], [326, 43.3, -3.63, -3.44], [57, 93.0, 5.9, 2.22], [235, 45.1, -1.73, -3.25]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2385, 51.6, 1.55, 3.92], [276, 44.9, -2.36, -2.29], [51, 94.1, 6.52, 2.64], [194, 43.3, -1.77, -2.64]],
-    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[1711, 48.1, 0.12, 1.34], [191, 33.5, -6.24, -4.03], [35, 57.1, -2.57, -1.21], [147, 56.5, 1.34, -0.79]],
-    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": [[3320, 51.8, 1.59, 3.64], [366, 41.8, -3.82, -2.22], [68, 79.4, 7.5, 2.26], [247, 48.2, 0.26, -1.28]],
-    "強勢突破盤 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2132, 51.2, 1.3, 4.08], [258, 43.0, -3.42, -2.18], [40, 82.5, 2.08, 0.18], [197, 50.8, 0.18, -0.9]],
-    "布林通道高檔(≥80%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[5468, 52.9, 1.98, 4.69], [584, 42.0, -3.33, -3.08], [103, 84.5, 6.47, 3.42], [424, 46.7, -0.97, -3.86]],
-    "大盤站上60日均線 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[6437, 51.5, 1.47, 4.01], [678, 41.3, -4.07, -3.02], None, None],
-    "回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[1266, 50.3, 1.21, 1.98], [153, 34.0, -6.3, -2.28], None, [110, 50.9, 0.64, -0.92]],
-    "OBV能量潮創60日新高 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1680, 48.9, 1.26, 2.58], [201, 35.3, -6.2, -1.93], [38, 86.8, 10.04, 2.36], [124, 53.2, 1.9, 0.58]],
-    "OBV能量潮創60日新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[2980, 51.6, 1.75, 4.09], [332, 41.6, -3.7, -1.74], [44, 70.5, 2.22, 0.48], [207, 48.3, 0.23, -0.99]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 目標價上檔空間≥40%": [[1573, 54.4, 1.43, 2.36], [493, 57.4, 2.8, 2.28], [51, 86.3, 9.53, 3.56], [728, 71.6, 5.55, 7.02]],
-    "漲時量≥跌時量1.5倍(近20日) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 高特有波動(年化≥60%)": [[4918, 55.6, 2.75, 8.67], [868, 52.0, 0.37, 2.28], [110, 70.9, 9.8, 3.21], [585, 54.2, 2.03, 1.73]],
-    "CMF資金流買方佔優(近20日≥0.1) ＋ 布林通道高檔(≥80%) ＋ 高Beta(>1.5)": [[10578, 54.9, 2.01, 7.49], [742, 47.2, -1.62, -0.04], [278, 74.8, 8.93, 4.75], [509, 49.3, 1.62, 3.38]],
-    "中期強勢(12-1月勝大盤≥20%) ＋ 所屬類股近6個月弱於大盤 ＋ 近1季財報EPS優於預期": [[25806, 53.3, 1.17, 8.87], [5481, 59.1, 1.54, 5.37], [823, 61.2, 4.21, 3.94], [5929, 61.2, 2.8, 6.33]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[27916, 54.9, 1.43, 6.12], [3675, 52.7, -0.41, 1.53], [922, 62.4, 5.26, 4.11], [4419, 60.4, 2.48, 7.6]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近20日強於大盤≥10%": [[23184, 53.7, 2.36, 9.02], [3645, 48.1, -1.25, 0.8], [631, 66.1, 7.06, 5.39], [3432, 54.7, 1.75, 4.16]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道收窄(寬度近半年最低20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[18529, 52.6, 0.85, 3.91], [3715, 56.3, 1.57, 3.3], [299, 62.5, 4.8, 2.73], [2690, 62.8, 3.02, 5.52]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": [[7463, 54.2, 1.14, 4.05], [839, 54.5, -0.01, 1.44], [159, 56.0, 1.41, 1.33], [1320, 64.1, 2.57, 1.11]],
+    "創52週新高 ＋ 大盤站上20日均線 ＋ 近20日強於大盤≥10%": [[21699, 51.2, 1.46, 7.13], None, [328, 57.9, 1.24, -1.4], None],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 高特有波動(年化≥60%)": [[9568, 53.3, 3.15, 8.85], [1642, 52.0, 1.17, 2.43], [209, 76.6, 16.07, 3.87], [1071, 54.2, 2.77, 2.73]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 布林通道高檔(≥80%) ＋ 高Beta(>1.5)": [[25906, 53.1, 1.61, 6.05], [1718, 45.9, -2.1, -0.75], [602, 74.1, 10.85, 5.42], [1117, 50.0, 1.33, 2.36]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 所屬類股近6個月弱於大盤 ＋ 近1季財報EPS優於預期": [[50289, 54.3, 1.24, 9.36], [9916, 59.5, 1.51, 5.98], [1378, 64.7, 6.79, 4.43], [10745, 62.2, 3.48, 7.05]],
+    "夜星剛形成 ＋ 相對強弱為負(弱於大盤) ＋ 近1季均價YoY為正": [[60, 51.7, -0.06, 0.37], None, None, None],
+    "大盤站上20日均線 ＋ 大盤跌破60日均線 ＋ 爆量(≥2倍均量)": [None, None, [509, 68.2, 1.46, 0.69], None],
+    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [275, 64.0, 5.92, 1.69]],
+    "夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [275, 64.0, 5.92, 1.69]],
+    "型態成形中 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [275, 64.0, 5.92, 1.69]],
+    "型態突破確認 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [275, 64.0, 5.92, 1.69]],
+    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 近1季均價YoY為正": [[133, 48.1, -0.92, 0.24], [38, 47.4, -3.78, -2.4], None, [48, 68.8, 11.89, 1.6]],
+    "夜星剛形成 ＋ 大盤跌破20日均線 ＋ 大盤跌破60日均線": [None, None, None, [275, 64.0, 5.92, 1.69]],
+    "KDJ近3日內黃金交叉 ＋ 大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成": [None, None, None, [438, 54.6, 2.85, 1.62]],
+    "大盤跌破60日均線 ＋ 相對強弱為正(強於大盤) ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [337, 59.6, 1.16, 0.9]],
+    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[313, 51.1, -0.13, 0.47], [57, 49.1, 0.8, 0.44], None, [51, 62.7, 7.87, 1.08]],
+    "型態成形中 ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[313, 51.1, -0.13, 0.47], [57, 49.1, 0.8, 0.44], None, [51, 62.7, 7.87, 1.08]],
+    "型態突破確認 ＋ 夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[313, 51.1, -0.13, 0.47], [57, 49.1, 0.8, 0.44], None, [51, 62.7, 7.87, 1.08]],
+    "夜星剛形成 ＋ 相對強弱為負(弱於大盤)": [[313, 51.1, -0.13, 0.47], [57, 49.1, 0.8, 0.44], None, [51, 62.7, 7.87, 1.08]],
+    "大盤跌破20日均線 ＋ 大盤跌破60日均線 ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [358, 58.4, 0.9, 0.7]],
+    "夜星剛形成 ＋ 近1季乖離度為負(股價超前營收) ＋ 近1季均價YoY為正": [[153, 43.1, -0.76, 0.17], [40, 47.5, -2.54, -2.5], None, [56, 71.4, 12.37, 3.12]],
+    "型態突破確認 ＋ 大盤跌破60日均線 ＋ 突破飆股大量黑K最高點剛形成": [None, None, None, [358, 58.4, 0.9, 0.7]],
+    "大盤站上20日均線 ＋ 大盤跌破60日均線 ＋ 突破ABC修正下降切線剛形成": [None, None, [360, 60.6, 1.02, 1.21], None],
+    "複式頭肩底剛形成 ＋ 近1季乖離度為正(營收優於股價) ＋ 近1季均價YoY為正": [[101, 50.5, 0.5, 0.85], None, None, None],
+    "K線橫盤的突破剛形成 ＋ 大盤站上20日均線 ＋ 突破飆股大量黑K最高點剛形成": [[563, 52.9, 0.63, 0.96], None, None, None],
+    "布林通道低檔(≤20%) ＋ 爆量(≥1.5倍均量) ＋ 相對強弱為正(強於大盤)": [[208, 47.1, 0.11, 0.02], [288, 58.0, 0.71, 0.67], None, [1753, 71.5, -0.08, -0.86]],
+    "夜星剛形成 ＋ 爆量(≥1.5倍均量) ＋ 近1季均價YoY為正": [[36, 47.2, -1.47, -0.93], None, None, None],
+    "型態突破確認 ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[215, 42.8, -2.0, -1.87], [54, 48.1, 1.08, -0.74], None, [48, 66.7, 2.83, 0.48]],
+    "夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[215, 42.8, -2.0, -1.87], [54, 48.1, 1.08, -0.74], None, [48, 66.7, 2.83, 0.48]],
+    "型態剛形成(剛突破) ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[215, 42.8, -2.0, -1.87], [54, 48.1, 1.08, -0.74], None, [48, 66.7, 2.83, 0.48]],
+    "型態成形中 ＋ 夜星剛形成 ＋ 爆量(≥1.5倍均量)": [[215, 42.8, -2.0, -1.87], [54, 48.1, 1.08, -0.74], None, [48, 66.7, 2.83, 0.48]],
+    "夜星剛形成 ＋ 布林通道低檔(≤20%) ＋ 近1季均價YoY為正": [None, None, None, None],
+    "夜星剛形成 ＋ 大盤站上20日均線 ＋ 相對強弱為正(強於大盤)": [[780, 49.0, 0.86, 1.15], None, None, None],
+    "夜星剛形成 ＋ 大盤跌破60日均線 ＋ 布林通道低檔(≤20%)": [None, None, None, [42, 57.1, 1.59, -0.12]],
+    "大盤站上60日均線 ＋ 布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成": [[244, 50.4, 0.74, 1.02], [80, 55.0, 2.54, 0.1], None, None],
+    "KDJ近3日內黃金交叉 ＋ 夜星剛形成 ＋ 大盤站上20日均線": [[352, 52.8, 1.73, 0.68], None, None, None],
+    "夜星剛形成 ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, [33, 63.6, 5.71, 1.04], None, [42, 57.1, 1.59, -0.12]],
+    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 近1季乖離度為負(股價超前營收)": [[103, 46.6, 0.1, 0.31], [30, 50.0, -2.01, -1.85], None, [47, 72.3, 12.92, 2.05]],
+    "KDJ近3日內黃金交叉 ＋ 布林通道低檔(≤20%) ＋ 母子懷抱(高檔)剛形成": [[141, 48.2, 0.33, 0.6], [48, 56.2, 1.23, -0.85], None, [238, 76.9, 4.53, 0.65]],
+    "夜星剛形成 ＋ 大盤跌破60日均線 ＋ 近1季均價YoY為正": [None, None, None, [62, 67.7, 10.81, 2.62]],
+    "夜星剛形成 ＋ 相對強弱為正(強於大盤) ＋ 近1季乖離度為負(股價超前營收)": [[110, 39.1, -1.05, 0.27], [31, 48.4, -1.83, -1.3], None, [46, 65.2, 9.08, 2.32]],
+    "MACD近3日內黃金交叉 ＋ 多方力道≥80 ＋ 突破ABC修正下降切線剛形成": [[153, 54.9, 1.29, 0.43], None, None, None],
+    "大盤站上20日均線 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[404, 50.5, 1.38, 0.98], None, None, None],
+    "多方力道≥65 ＋ 爆量(≥2倍均量) ＋ 突破ABC修正下降切線剛形成": [[325, 50.5, 0.76, 0.16], [77, 49.4, -0.64, -0.88], None, None],
+    "多方力道≥80 ＋ 爆量(≥1.5倍均量) ＋ 突破ABC修正下降切線剛形成": [[285, 52.3, 1.72, 1.63], [50, 46.0, -1.83, 0.04], None, None],
+    "晨星剛形成 ＋ 爆量(≥1.5倍均量) ＋ 近1季均價YoY為正": [[63, 55.6, 2.9, -0.42], [41, 53.7, -1.35, -0.49], None, None],
+    "突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成 ＋ 近1季乖離度為負(股價超前營收)": [[62, 45.2, -1.24, -1.82], None, None, None],
+    "大盤站上60日均線 ＋ 晨星剛形成 ＋ 爆量(≥1.5倍均量)": [[404, 50.5, 1.38, 0.98], [175, 56.6, 1.12, 2.24], None, None],
+    "突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成 ＋ 近1季均價YoY為正": [[78, 39.7, -1.67, -2.56], None, None, None],
+    "強勢突破盤 ＋ 爆量(≥2倍均量) ＋ 突破ABC修正下降切線剛形成": [[423, 49.6, 0.47, 0.68], [75, 48.0, -0.75, -1.35], None, [47, 53.2, -1.05, -0.24]],
+    "爆量(≥2倍均量) ＋ 突破ABC修正下降切線剛形成 ＋ 近1季乖離度為正(營收優於股價)": [[121, 51.2, 1.38, 1.3], [32, 75.0, 7.98, 2.33], None, None],
+    "多方力道≥80 ＋ 爆量(≥2倍均量) ＋ 突破飆股大量黑K最高點剛形成": [[193, 56.5, 2.64, 1.38], [35, 57.1, -3.28, -1.08], None, None],
+    "多方力道≥65 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": [[160, 50.0, -1.02, -1.34], [32, 53.1, 1.69, 0.57], None, None],
+    "K線橫盤的突破剛形成 ＋ 大盤跌破20日均線 ＋ 突破ABC修正下降切線剛形成": [None, [151, 58.3, 2.41, -0.23], None, [87, 55.2, -1.2, -1.88]],
+    "回後買上漲全通過 ＋ 多方力道≥80 ＋ 突破飆股大量黑K最高點剛形成": [[252, 49.6, 0.83, 0.05], [36, 52.8, -1.94, -1.15], None, None],
+    "K線橫盤的突破剛形成 ＋ 圓弧底剛形成 ＋ 爆量(≥2倍均量)": [[177, 47.5, -0.36, -0.34], [30, 56.7, -0.74, 0.13], None, None],
+    "KDJ近3日內死亡交叉 ＋ 夜星剛形成 ＋ 大盤跌破60日均線": [None, None, None, [185, 62.7, 6.1, 1.02]],
+    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 量能區間高檔(≥90百分位)": [[155, 54.2, 13.85, 3.29], None, None, None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [5356, 62.8, 2.94, 4.75], [41389, 58.3, 1.92, 8.94]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [2374, 64.6, 4.79, 5.86], [18042, 59.3, 2.29, 7.88]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS優於預期": [None, None, [3667, 64.1, 3.56, 4.99], [28033, 59.1, 1.88, 7.54]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 布林通道低檔(≤20%)": [None, None, [258, 72.9, 4.45, 2.2], [14252, 59.7, 2.18, 7.25]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 近1季財報EPS優於預期": [[41111, 54.7, 1.06, 5.35], [5270, 54.1, -0.28, 1.71], [1310, 62.1, 3.65, 3.7], [6656, 60.7, 2.14, 8.87]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 大盤跌破60日均線": [None, None, None, [41389, 58.3, 1.92, 8.94]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, [8224, 57.7, 1.74, 4.84], None, [14252, 59.7, 2.18, 7.25]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤)": [None, None, [2350, 60.3, 0.76, 1.21], [23761, 58.1, 2.15, 8.11]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%)": [[56483, 53.8, 1.04, 6.38], [7431, 51.7, -0.62, 0.33], [1900, 59.2, 2.26, 4.18], [9921, 58.7, 2.15, 7.72]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [8717, 62.2, 1.39, 5.34], [60590, 57.1, 0.41, 4.53]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能區間高檔(≥90百分位)": [None, None, [1083, 66.3, 1.37, 2.74], [10843, 57.7, 0.97, 5.3]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 相對強弱為負(弱於大盤)": [None, [16103, 55.5, 1.25, 3.66], None, [23761, 58.1, 2.15, 8.11]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近5日跌幅≥8%(短線超跌)": [None, None, [164, 67.1, 4.53, 0.9], [6555, 58.5, 3.62, 5.67]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 相對強弱為正(強於大盤)": [None, None, [3006, 64.8, 4.65, 5.64], [17628, 58.5, 1.62, 6.03]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS優於預期 ＋ 量能區間高檔(≥90百分位)": [None, None, [1957, 66.0, 0.15, 0.34], [21172, 57.1, 0.31, 2.8]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破60日均線": [None, None, [3713, 61.3, 2.23, 3.75], [30643, 58.8, 1.9, 7.76]],
+    "大盤跌破20日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, [24034, 56.8, 0.97, 5.64], None, [31124, 58.4, 0.91, 4.49]],
+    "大盤跌破20日均線 ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, None, [60590, 57.1, 0.41, 4.53]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS低於預期": [None, None, [1338, 60.5, 1.98, 1.97], [9229, 60.1, 2.52, 8.14]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能區間高檔(≥90百分位)": [[7933, 54.8, 2.11, 5.95], [1333, 48.8, -1.57, 0.35], [234, 64.5, 1.15, 0.94], [1734, 57.4, 2.2, 2.39]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[2248, 55.6, 4.52, 5.98], [194, 55.2, 2.52, 1.15], None, [155, 45.2, -0.2, -0.18]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 近1季財報EPS低於預期": [None, [6387, 49.2, -0.4, -0.06], None, [9229, 60.1, 2.52, 8.14]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, None, [629, 62.5, 1.6, 2.51], [5721, 58.6, 1.31, 0.31]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, None, [1023, 63.5, 1.51, 3.72], [8757, 60.7, 0.35, 2.48]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [2840, 62.2, 2.77, 4.68], [23172, 59.1, 1.4, 6.23]],
+    "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 量能區間高檔(≥90百分位)": [None, None, [1700, 64.9, -0.93, -2.61], [18345, 57.7, 0.4, 1.66]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [None, None, [684, 54.5, 1.9, 4.23], [7348, 59.7, 0.58, 3.38]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近20日財報跳空上漲": [[2634, 58.6, 4.63, 5.32], [204, 56.4, 3.62, -0.26], None, [218, 53.2, 3.87, 0.2]],
+    "KDJ近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [1685, 66.7, 4.25, 2.84], [12200, 58.4, 1.97, 4.76]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 近5日跌幅≥8%(短線超跌)": [None, [3671, 52.7, 0.95, 1.42], None, [6555, 58.5, 3.62, 5.67]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 近1季財報EPS優於預期": [[16485, 51.6, 0.5, 1.71], [5713, 60.3, 2.15, 5.23], [153, 73.2, 4.42, 3.1], [9702, 60.3, 2.21, 7.01]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近20日財報跳空上漲": [[2915, 59.3, 4.47, 5.37], [203, 52.7, 1.15, -0.73], [54, 81.5, 5.03, 1.79], [249, 52.2, 3.04, 0.39]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上20日均線 ＋ 近1季財報EPS大幅優於預期(≥10%)": [[87116, 54.3, 0.52, 5.33], None, [3064, 64.6, 2.27, 3.38], None],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[3242, 48.1, 0.49, 2.78], [948, 55.7, 0.68, 2.89], [89, 65.2, 5.25, 2.08], [2621, 58.4, 2.35, 5.06]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 相對強弱為負(弱於大盤)": [[23834, 51.0, 0.51, 2.82], [7706, 57.9, 1.71, 4.67], [241, 72.2, 3.69, 1.03], [12222, 58.5, 2.22, 6.81]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[4689, 56.2, 4.55, 8.81], [500, 50.4, -1.2, -0.14], [39, 56.4, -2.8, -2.04], [317, 47.0, 0.35, -1.62]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤跌破20日均線 ＋ 布林通道低檔(≤20%)": [None, [10354, 57.9, 1.32, 4.14], None, [19268, 60.8, 1.25, 4.74]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 近20日強於大盤≥10%": [None, None, [1108, 71.2, 9.67, 7.12], [5949, 55.9, 1.94, 4.45]],
+    "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近1季財報EPS大幅優於預期(≥10%)": [None, None, [4224, 60.5, 0.09, 0.24], [31124, 58.4, 0.91, 4.49]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%)": [[24326, 51.0, 0.5, 2.85], [8224, 57.7, 1.74, 4.84], [258, 72.9, 4.45, 2.2], [14252, 59.7, 2.18, 7.25]],
+    "短線過熱(高於月線≥20%) ＋ 距52週高點≤5% ＋ 近20日財報跳空上漲": [[1838, 57.7, 3.25, 4.61], [131, 48.9, 0.72, -0.38], None, [125, 51.2, 2.53, 1.35]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥65": [[28598, 55.0, 1.81, 7.7], [3285, 50.7, -0.58, -0.07], [368, 53.5, 1.18, 0.69], [2332, 49.0, 0.8, -1.08]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[5251, 51.0, 0.56, 2.27], [1490, 59.4, 1.22, 2.74], [117, 72.6, 3.53, 2.49], [2614, 58.1, 1.39, 1.46]],
+    "NR7窄幅日(近7日振幅最小) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線": [None, None, [974, 61.9, 2.44, 1.69], [5877, 57.9, 1.95, 4.69]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線": [None, [31439, 53.7, 0.33, 1.76], None, [41389, 58.3, 1.92, 8.94]],
+    "大盤跌破20日均線 ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, [6599, 58.4, 0.35, 0.73], None, [8757, 60.7, 0.35, 2.48]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 布林通道低檔(≤20%)": [[2041, 54.8, 0.73, 3.18], [594, 55.2, 0.58, 2.02], None, [1869, 65.9, 2.99, 4.62]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[8052, 54.4, 1.62, 4.55], [1006, 50.7, -0.59, 0.24], [246, 60.2, 1.5, 1.11], [1359, 57.4, 1.53, 0.09]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破60日均線 ＋ 量能區間高檔(≥90百分位)": [None, None, [617, 66.1, 2.84, 2.4], [6971, 55.7, 1.77, 4.65]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤跌破20日均線 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [None, [4238, 56.1, 0.39, 2.3], None, [5721, 58.6, 1.31, 0.31]],
+    "大盤跌破60日均線 ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [None, None, [277, 57.4, -0.97, -1.41], [5844, 60.7, 1.66, 3.53]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 布林通道低檔(≤20%)": [[16585, 49.7, 0.39, 2.89], [5590, 58.0, 1.82, 4.1], [166, 69.9, 4.04, 3.19], [10667, 59.6, 2.14, 5.95]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[830, 54.0, 6.82, 5.47], [115, 47.8, -1.55, -0.44], None, [71, 45.1, -4.17, -1.78]],
+    "多方力道≥80 ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[175, 54.9, 9.2, 2.03], [39, 53.8, 5.12, 0.67], None, None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1544, 54.3, 6.05, 5.67], [191, 39.8, -4.96, -1.48], [33, 69.7, 10.14, 0.53], [119, 49.6, 0.03, -0.09]],
+    "KDJ近3日內死亡交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[662, 56.6, 6.32, 5.05], [90, 31.1, -7.47, -1.78], None, [54, 46.3, -0.62, -0.19]],
+    "回後買上漲全通過 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1149, 53.1, 5.29, 4.72], [153, 40.5, -2.48, -1.42], None, [100, 41.0, -1.94, -2.0]],
+    "KDJ近3日內死亡交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[1320, 54.5, 5.26, 5.48], [147, 38.1, -6.69, -0.71], None, [91, 58.2, 3.57, 1.05]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[2744, 53.4, 4.57, 4.65], [281, 43.1, -4.24, 0.66], [58, 81.0, 21.51, 3.86], [159, 47.2, 0.78, 1.18]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1942, 53.2, 4.59, 5.11], [238, 43.3, -2.23, 0.59], [32, 75.0, 7.31, 0.74], [134, 44.8, -1.16, -1.15]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[3795, 55.3, 5.81, 8.78], [328, 44.2, -2.6, 0.82], [64, 67.2, 11.85, 3.19], [242, 53.7, 2.81, 1.09]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1479, 54.4, 5.53, 5.23], [165, 52.1, 1.31, 0.63], None, [119, 43.7, -1.83, -1.57]],
+    "多方力道≥80 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1006, 54.4, 5.54, 4.05], [139, 48.2, -1.69, -1.36], None, [73, 42.5, -3.12, -1.04]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[864, 55.2, 6.25, 5.61], [130, 36.9, -6.86, -1.39], None, [67, 50.7, 0.86, -0.66]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1851, 54.6, 5.37, 5.94], [151, 41.7, -2.77, 0.36], [48, 75.0, 9.33, 0.54], [103, 48.5, 1.31, 0.45]],
+    "大盤站上20日均線 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[2008, 51.5, 3.83, 4.16], None, [39, 71.8, 10.06, 1.24], None],
+    "KDJ近3日內黃金交叉 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1447, 50.6, 2.5, 3.42], [200, 42.5, -2.4, 0.12], None, [123, 53.7, 3.34, 0.08]],
+    "多方力道≥80 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[108, 48.1, 6.63, 2.19], None, None, None],
+    "KDJ近3日內死亡交叉 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[356, 56.5, 6.84, 3.74], [52, 36.5, -6.89, -1.89], None, [32, 34.4, -4.14, -1.03]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2002, 53.8, 5.39, 6.35], [258, 41.9, -3.1, -0.27], [34, 73.5, 6.27, 0.14], [148, 48.0, -1.92, -1.88]],
+    "大盤站上20日均線 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[3585, 52.4, 3.83, 6.04], None, [61, 72.1, 8.31, 0.75], None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2672, 55.5, 5.55, 7.33], [275, 47.3, -0.73, -1.06], [46, 67.4, 3.28, -0.88], [193, 49.7, 0.95, -0.34]],
+    "KDJ近3日內黃金交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1382, 52.6, 3.84, 3.61], [207, 50.7, 1.41, 1.22], None, [116, 41.4, -2.84, -2.07]],
+    "KDJ近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[1549, 53.8, 4.2, 5.9], [161, 40.4, -4.61, -0.77], None, [98, 48.0, 0.98, -0.25]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1853, 52.7, 3.71, 4.76], [287, 49.8, 0.0, 0.75], None, [181, 44.8, -2.5, -2.96]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[5024, 52.7, 4.18, 7.26], None, [90, 73.3, 12.23, 2.75], None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[4196, 54.3, 5.13, 7.59], [444, 43.0, -2.98, 0.49], [65, 69.2, 12.64, 1.7], [270, 49.6, 1.11, 0.16]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[5024, 52.7, 4.18, 7.26], [540, 41.1, -4.41, -0.14], [90, 73.3, 12.23, 2.75], [343, 50.7, 1.54, 0.09]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5010, 52.8, 4.25, 7.33], [538, 41.3, -4.28, -0.09], [87, 74.7, 13.18, 2.95], [339, 51.3, 1.92, 0.21]],
+    "多方力道≥80 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1944, 55.5, 5.44, 5.65], [245, 46.1, -2.68, -1.75], None, [137, 48.9, 1.3, -0.05]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[2255, 53.6, 4.51, 5.95], [301, 45.2, -2.57, -1.63], [42, 81.0, 11.57, 3.38], [196, 45.9, -0.27, -0.48]],
+    "KDJ近3日內黃金交叉 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[1979, 55.1, 4.35, 5.69], [257, 51.4, -0.55, -0.55], None, [140, 45.7, -1.92, -2.36]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[4935, 52.9, 4.34, 7.49], [530, 41.9, -4.12, 0.05], [86, 74.4, 13.17, 2.96], [337, 51.6, 2.11, 0.32]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[3168, 52.9, 3.33, 5.4], [404, 48.8, -0.79, 0.29], [46, 54.3, 6.93, -0.24], [259, 45.6, -1.47, -2.99]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[3585, 52.4, 3.83, 6.04], [460, 45.0, -2.23, -0.58], [61, 72.1, 8.31, 0.75], [310, 46.1, -1.01, -1.29]],
+    "KDJ近3日內黃金交叉 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[3164, 52.9, 3.35, 5.43], [402, 49.0, -0.6, 0.33], [46, 54.3, 6.93, -0.24], [257, 45.9, -1.16, -2.6]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[3139, 53.1, 3.43, 5.52], [397, 48.9, -0.59, 0.25], [44, 56.8, 7.94, -0.11], [254, 46.1, -0.93, -2.41]],
+    "爆量(≥1.5倍均量) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[3577, 52.4, 3.85, 6.08], [460, 45.0, -2.23, -0.58], [60, 71.7, 8.48, 0.76], [305, 46.9, -0.59, -1.21]],
+    "OBV能量潮創60日新高 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2316, 52.4, 3.53, 4.22], [327, 45.6, -1.58, -0.68], [37, 62.2, 6.94, 0.52], [177, 51.4, 1.57, 0.05]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1502, 52.1, 3.7, 3.74], [213, 46.9, -1.79, -0.91], None, [110, 48.2, -0.97, -0.18]],
+    "大盤跌破60日均線 ＋ 布林通道收窄(寬度近半年最低20%) ＋ 母子懷抱(低檔)剛形成": [None, None, None, [110, 59.1, 7.23, 2.05]],
+    "KDJ近3日內黃金交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[3168, 52.9, 3.33, 5.4], None, [46, 54.3, 6.93, -0.24], None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[3267, 54.0, 5.05, 6.08], [341, 44.0, -4.26, 0.88], [61, 82.0, 20.55, 3.68], [198, 52.0, 2.75, 2.27]],
+    "KDJ近3日內黃金交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[2710, 53.2, 3.71, 5.19], [344, 49.7, -0.45, -0.02], None, [200, 46.5, -1.03, -2.07]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[4363, 53.4, 4.55, 7.71], [484, 41.5, -4.01, 0.32], [50, 68.0, 4.88, 0.05], [283, 52.7, 2.26, 0.38]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[3527, 52.5, 3.9, 6.12], [455, 44.8, -2.25, -0.6], [58, 72.4, 8.81, 0.67], [297, 47.1, -0.35, -1.08]],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1083, 52.4, 4.73, 3.75], [150, 40.0, -3.04, -1.18], None, [98, 41.8, -2.81, -2.82]],
+    "布林通道高檔(≥80%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[3553, 52.3, 3.8, 5.91], [453, 45.7, -1.92, -0.36], [61, 72.1, 8.31, 0.75], [307, 45.9, -1.02, -1.39]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[1499, 50.0, 3.53, 4.62], [212, 36.8, -5.42, -0.46], [35, 74.3, 12.65, 1.44], [141, 53.9, 2.5, 0.48]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1941, 51.6, 3.52, 3.96], [280, 48.2, -1.05, -0.62], [39, 71.8, 10.06, 1.24], [186, 41.4, -3.48, -2.66]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[2432, 54.6, 4.41, 6.43], [271, 48.7, -0.46, 0.01], [33, 57.6, 11.93, 0.64], [175, 48.0, 0.53, -0.71]],
+    "KDJ近3日內死亡交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[2718, 54.5, 4.7, 6.51], None, [35, 54.3, 4.57, 0.57], None],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4681, 51.9, 3.52, 6.35], None, [69, 71.0, 4.43, -0.63], None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[4733, 52.7, 4.11, 6.95], [504, 39.9, -4.93, -0.76], [89, 73.0, 12.26, 2.77], [306, 50.3, 0.86, -0.38]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[3058, 53.6, 4.27, 5.44], [392, 46.4, -1.66, -0.91], [53, 67.9, 6.44, 0.2], [236, 48.3, 0.42, -0.49]],
+    "KDJ近3日內黃金交叉 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[2713, 54.2, 4.0, 5.4], [332, 50.9, 0.24, 0.05], None, [209, 46.9, -2.29, -3.2]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[5024, 52.7, 4.18, 7.26], [540, 41.1, -4.41, -0.14], None, None],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2944, 52.4, 3.62, 5.5], [386, 45.9, -2.03, -1.09], [45, 68.9, 5.69, 0.56], [267, 44.2, -2.21, -2.54]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[1262, 52.9, 4.43, 4.03], [183, 49.2, -1.11, -1.59], None, [121, 41.3, -2.07, -1.4]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1703, 52.7, 4.01, 3.91], [244, 49.6, -0.19, -0.17], [36, 69.4, 9.26, 1.05], [143, 43.4, -2.47, -2.04]],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[5299, 51.7, 3.7, 6.82], None, [106, 64.2, 2.05, -0.64], None],
+    "多方力道≥65 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1585, 51.7, 4.22, 3.69], [219, 48.9, -0.7, -0.65], None, [135, 43.0, -2.28, -1.85]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1528, 52.8, 3.16, 4.5], [220, 52.3, 1.98, 1.44], None, [138, 42.8, -3.68, -2.5]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%)": [[2037, 57.3, 6.27, 7.97], [211, 47.9, -2.97, -1.4], None, [130, 54.6, 1.98, 1.34]],
+    "KDJ近3日內黃金交叉 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[3029, 52.7, 3.08, 4.84], [387, 49.1, -0.64, 0.42], [44, 56.8, 9.13, 0.03], [248, 45.2, -1.62, -2.94]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[2008, 51.5, 3.83, 4.16], [284, 48.2, -1.02, -0.59], [39, 71.8, 10.06, 1.24], [190, 41.1, -3.64, -2.73]],
+    "爆量(≥2倍均量) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[2003, 51.5, 3.85, 4.23], [284, 48.2, -1.02, -0.59], [39, 71.8, 10.06, 1.24], [186, 41.9, -3.07, -2.55]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[1970, 51.8, 3.89, 4.15], [280, 47.9, -1.05, -0.61], [37, 73.0, 10.66, 1.14], [182, 41.8, -2.76, -2.31]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 強勢突破盤 ＋ 短線過熱(高於月線≥20%)": [[2646, 53.7, 4.51, 5.84], [295, 39.7, -4.01, -0.16], [54, 72.2, 8.74, 0.79], [173, 50.9, 1.37, 0.61]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[688, 54.8, 4.31, 4.06], [69, 49.3, -2.42, -0.12], None, [43, 34.9, -3.13, -1.01]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3462, 55.0, 5.07, 7.55], [360, 50.0, -0.16, -0.78], [51, 72.5, 2.82, -1.13], [256, 48.8, 0.06, -1.58]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1860, 51.8, 3.72, 3.91], [270, 47.8, -1.02, -0.53], [34, 70.6, 9.62, 1.18], [180, 41.1, -3.79, -2.74]],
+    "多方力道≥65 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2930, 52.9, 4.19, 5.78], [374, 45.2, -2.07, -1.0], [34, 64.7, 2.42, -0.43], [234, 47.9, 0.33, -0.58]],
+    "MACD近3日內黃金交叉 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[552, 48.6, 1.4, 1.47], [79, 41.8, -3.3, -0.41], None, [43, 51.2, -1.35, 0.36]],
+    "KDJ近3日內死亡交叉 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[1252, 54.9, 4.17, 4.87], [188, 40.4, -6.12, -0.87], None, [104, 61.5, 6.12, 1.37]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3186, 51.9, 3.39, 5.34], [428, 45.3, -2.06, -0.98], [58, 70.7, 6.85, 0.61], [291, 46.7, -1.01, -1.3]],
+    "多方力道≥80 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 近5日跌幅≥8%(短線超跌)": [[392, 56.6, 5.93, 3.1], [100, 61.0, 4.98, 1.44], None, [62, 58.1, 5.07, 0.78]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1168, 54.6, 6.16, 5.98], [166, 44.0, -3.39, -1.04], None, [109, 46.8, -0.73, -1.42]],
+    "OBV能量潮創60日新高 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1423, 52.4, 3.63, 3.24], [209, 48.8, 0.58, 0.77], None, [122, 46.7, -1.4, -1.74]],
+    "KDJ近3日內黃金交叉 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[852, 51.8, 3.63, 2.41], [132, 56.8, 3.57, 1.68], None, [85, 37.6, -4.93, -2.34]],
+    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2558, 51.9, 3.1, 4.06], [357, 46.8, -1.07, 0.01], [32, 62.5, 5.55, 0.93], [198, 49.5, 0.25, -1.48]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3892, 55.3, 5.62, 8.16], [411, 48.4, -0.31, -0.89], [71, 66.2, 0.28, -1.23], [317, 50.2, 1.29, -1.09]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[795, 48.4, 2.96, 2.31], [119, 41.2, -5.28, -1.53], None, [89, 47.2, -1.68, -1.11]],
+    "母子懷抱(高檔)剛形成 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[119, 48.7, 6.04, 2.19], None, None, None],
+    "大盤站上60日均線 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[141, 50.4, 5.39, 2.23], None, None, None],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[2250, 52.2, 4.5, 6.04], [307, 42.7, -2.48, 1.03], [49, 75.5, 7.99, -0.0], [212, 49.1, 0.01, -0.44]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[3144, 55.0, 5.29, 8.58], [331, 48.3, -1.99, 1.15], None, [201, 57.2, 4.85, 1.17]],
+    "布林通道高檔(≥80%) ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1997, 51.4, 3.82, 4.11], [280, 48.9, -0.65, -0.32], [39, 71.8, 10.06, 1.24], [189, 41.3, -3.46, -2.71]],
+    "OBV能量潮創60日新高 ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 短線過熱(高於月線≥20%)": [[2452, 53.6, 4.96, 5.48], [275, 41.5, -3.7, 0.57], [49, 75.5, 21.2, 3.26], [139, 57.6, 4.49, 2.05]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1600, 52.1, 3.74, 3.69], [237, 49.4, -1.26, -0.82], [31, 74.2, 10.63, 1.46], [153, 41.8, -3.43, -2.28]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[4323, 53.6, 4.56, 8.34], [467, 41.8, -4.43, 0.3], [50, 74.0, 6.6, 0.28], [286, 55.9, 3.89, 1.69]],
+    "KDJ近3日內黃金交叉 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[3168, 52.9, 3.33, 5.4], [404, 48.8, -0.79, 0.29], None, None],
+    "KDJ近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[2652, 53.0, 3.63, 5.87], [360, 48.3, -0.77, -0.32], None, [197, 47.7, 0.23, -1.14]],
+    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4681, 51.9, 3.52, 6.35], [591, 46.7, -1.92, -1.09], [69, 71.0, 4.43, -0.63], [410, 44.1, -2.15, -3.38]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4674, 51.9, 3.54, 6.37], [591, 46.7, -1.92, -1.09], [69, 71.0, 4.43, -0.63], [406, 44.6, -1.87, -3.28]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近20日強於大盤≥10%": [[226, 46.5, 0.65, 0.58], [47, 51.1, 1.43, 0.9], None, [48, 68.8, 7.57, 1.88]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4637, 51.8, 3.47, 6.37], [579, 47.7, -1.48, -0.7], [69, 71.0, 4.43, -0.63], [401, 43.9, -2.35, -3.43]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2524, 52.3, 3.44, 4.49], [323, 49.5, -1.7, -1.37], [44, 75.0, 7.23, 1.06], [222, 42.8, -2.09, -2.0]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[2748, 52.9, 3.86, 5.75], [365, 43.0, -3.16, -1.09], None, [186, 53.8, 2.29, 1.07]],
+    "大盤站上60日均線 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[2008, 51.5, 3.83, 4.16], [284, 48.2, -1.02, -0.59], None, None],
+    "KDJ近3日內黃金交叉 ＋ 強勢突破盤 ＋ 短線過熱(高於月線≥20%)": [[1840, 52.4, 2.08, 3.15], [242, 50.0, -0.04, 0.78], [35, 60.0, 11.25, 0.44], [162, 43.8, 0.26, -0.66]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[5279, 51.8, 3.74, 6.82], [680, 46.9, -1.32, -0.04], [105, 63.8, 2.09, -0.62], [524, 45.6, -1.15, -3.84]],
+    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3021, 52.6, 3.17, 4.58], [402, 46.3, -1.1, 0.58], [57, 61.4, 4.83, 0.53], [243, 51.4, 1.15, 0.03]],
+    "回後買上漲全通過 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[2086, 53.0, 3.85, 4.41], [234, 41.0, -2.43, -1.72], None, [161, 44.7, -0.71, -2.4]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[548, 53.8, 5.43, 3.62], [80, 51.2, -1.03, 0.78], None, [51, 41.2, -5.07, -2.17]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[2729, 54.6, 5.09, 6.14], [350, 51.1, -0.39, 0.14], None, [195, 46.7, -0.5, -1.38]],
+    "回後買上漲全通過 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[686, 52.6, 5.31, 3.07], [102, 43.1, -0.83, -0.27], None, [64, 28.1, -6.28, -3.52]],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3979, 52.4, 4.03, 6.37], [502, 48.0, -1.35, -0.65], [39, 69.2, 1.15, 0.04], [325, 45.8, -1.32, -2.32]],
+    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4610, 52.0, 3.63, 6.42], [586, 46.9, -1.84, -1.07], [67, 71.6, 4.6, -0.36], [398, 44.7, -1.71, -3.23]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3012, 52.9, 3.8, 6.01], [390, 49.2, -1.82, -1.02], [47, 83.0, 9.62, 3.75], [266, 44.4, -1.25, -1.65]],
+    "短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[5299, 51.7, 3.7, 6.82], [682, 46.8, -1.44, -0.07], [106, 64.2, 2.05, -0.64], [528, 45.3, -1.36, -3.92]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 母子懷抱(高檔)剛形成 ＋ 漲時量≥跌時量1.5倍(近20日)": [[240, 54.2, 4.59, 1.98], [39, 66.7, 9.38, 1.95], None, [30, 73.3, 8.72, 1.97]],
+    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 量能區間高檔(≥90百分位)": [[5213, 51.9, 3.81, 6.92], [671, 47.1, -1.25, -0.05], [103, 64.1, 2.15, -0.66], [515, 45.8, -0.99, -3.79]],
+    "短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口 ＋ 量能區間高檔(≥90百分位)": [[2699, 51.6, 2.97, 4.48], [292, 52.7, 1.46, 1.11], [66, 71.2, 8.87, 0.92], [270, 46.7, -0.58, -1.13]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1886, 50.0, 2.71, 3.38], [232, 39.2, -4.49, -0.09], [33, 75.8, 8.97, 1.29], [164, 47.6, -1.14, -1.29]],
+    "回後買上漲全通過 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[2480, 52.1, 3.27, 4.46], None, [41, 65.9, 8.6, 0.94], None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [[412, 46.4, 5.27, 2.28], [119, 43.7, -2.18, -0.95], None, [66, 57.6, 7.06, 1.24]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 近5日跌幅≥8%(短線超跌) ＋ 量能區間高檔(≥90百分位)": [[322, 52.2, 5.47, 2.35], [76, 48.7, -0.19, 0.38], None, [71, 52.1, 2.76, 1.42]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[1702, 55.8, 5.15, 6.33], [193, 45.1, -4.15, -1.26], None, [120, 51.7, 1.19, 0.71]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3995, 52.9, 3.95, 6.11], [500, 48.4, -0.59, -0.55], [57, 68.4, 4.08, -0.49], [313, 45.4, -1.43, -2.9]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1133, 52.1, 3.54, 3.0], [150, 35.3, -5.33, -0.59], None, [95, 53.7, 2.08, 0.11]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%)": [[2718, 54.5, 4.7, 6.51], [321, 44.9, -4.46, -1.43], [35, 54.3, 4.57, 0.57], [193, 51.3, 0.69, -0.57]],
+    "KDJ近3日內死亡交叉 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[2715, 54.5, 4.71, 6.53], [321, 44.9, -4.46, -1.43], [35, 54.3, 4.57, 0.57], [190, 52.1, 1.27, -0.06]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[2707, 54.6, 4.7, 6.54], [320, 45.0, -4.39, -1.41], [33, 54.5, 4.85, 0.51], [190, 52.1, 1.27, -0.06]],
+    "KDJ近3日內死亡交叉 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[2392, 54.4, 4.16, 5.79], [280, 43.9, -4.76, -0.8], [31, 54.8, 5.79, 0.64], [147, 50.3, -0.35, -0.43]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[4579, 52.8, 4.27, 6.94], [578, 48.4, -0.4, 0.09], [89, 60.7, 1.85, -0.54], [413, 47.0, -0.7, -3.63]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1919, 49.3, 2.6, 4.49], [255, 36.5, -5.21, -0.32], [34, 76.5, 9.13, 1.2], [185, 49.2, -0.47, -1.29]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[4345, 52.2, 4.0, 6.75], [562, 45.4, -1.7, 0.41], [57, 63.2, 0.98, -0.61], [367, 50.7, 1.0, -1.42]],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[4692, 51.8, 2.95, 5.38], None, [88, 79.5, 6.01, 0.65], None],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1041, 52.6, 4.2, 2.97], [139, 44.6, -3.45, -1.85], None, [92, 37.0, -4.28, -4.32]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1999, 53.3, 3.91, 5.17], [198, 39.4, -3.08, -1.54], [30, 60.0, 9.54, 0.82], [149, 47.7, -0.51, -2.04]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[132, 50.0, 5.51, 2.17], None, None, None],
+    "多方力道≥65 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[134, 51.5, 6.48, 2.56], None, None, None],
+    "大盤站上20日均線 ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[141, 50.4, 5.39, 2.23], None, None, None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成": [[184, 48.9, 1.06, 0.98], [34, 55.9, 2.15, 0.8], None, [37, 70.3, 6.76, 1.02]],
+    "KDJ近3日內死亡交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[2534, 54.9, 4.91, 6.61], [301, 45.8, -4.36, -1.35], None, [174, 53.4, 1.42, -0.24]],
+    "大盤站上60日均線 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[3585, 52.4, 3.83, 6.04], [460, 45.0, -2.23, -0.58], None, None],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[4894, 51.6, 3.08, 6.27], None, [89, 77.5, 9.05, 2.12], None],
+    "KDJ近3日內死亡交叉 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[2095, 56.5, 5.48, 7.25], [258, 48.1, -3.28, -0.81], None, [147, 55.8, 1.93, 0.14]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[3401, 54.7, 5.64, 6.81], [420, 49.0, -0.14, 0.72], [37, 51.4, -4.63, -0.93], [295, 48.5, 0.87, -2.09]],
+    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 量能區間高檔(≥90百分位)": [[3416, 51.5, 3.21, 5.3], [468, 47.2, -1.38, -0.61], [58, 69.0, 5.1, -0.18], [341, 42.5, -2.91, -3.82]],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[4542, 52.5, 4.27, 6.89], [582, 47.3, -0.91, 0.21], [65, 56.9, -2.2, -0.66], [431, 46.4, -0.55, -2.77]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[8286, 55.0, 4.55, 9.92], None, [150, 66.7, 5.74, 2.49], None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥80 ＋ 近5日跌幅≥8%(短線超跌)": [[475, 53.5, 5.08, 3.08], [132, 62.9, 5.31, 1.69], None, [67, 55.2, 4.56, 0.79]],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[1443, 52.3, 3.91, 4.2], [198, 41.9, -3.2, -2.52], None, [143, 44.8, -0.76, -1.25]],
+    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[7245, 54.7, 4.19, 8.28], None, [59, 61.0, -1.68, -1.15], None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3419, 54.5, 4.52, 6.98], [335, 51.9, 0.31, -0.39], [66, 81.8, 5.6, 0.14], [236, 46.6, -0.04, -1.11]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 量能區間高檔(≥90百分位)": [[3280, 53.7, 4.23, 7.06], [429, 48.0, -1.47, -0.68], [73, 72.6, 6.11, 1.63], [335, 44.2, -0.5, -2.49]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[5054, 51.5, 3.22, 6.13], [648, 47.4, -1.56, 0.12], [101, 66.3, 3.23, -0.34], [487, 44.1, -2.12, -3.94]],
+    "OBV能量潮創60日新高 ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1607, 52.8, 3.26, 4.15], [190, 40.5, -2.09, -1.54], None, [125, 46.4, 0.35, -1.04]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近5日跌幅≥8%(短線超跌)": [[759, 50.3, 2.2, 2.55], [208, 60.1, 2.04, 0.83], None, [168, 61.9, 7.26, 1.03]],
+    "KDJ近3日內死亡交叉 ＋ KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[1028, 54.8, 4.31, 4.94], [142, 47.2, -3.5, -1.11], None, [67, 41.8, -2.91, -0.89]],
+    "KDJ近3日內死亡交叉 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[2389, 56.0, 5.2, 6.38], [278, 44.6, -4.31, -1.54], None, [167, 53.3, 0.61, -0.63]],
+    "KDJ近3日內死亡交叉 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[2718, 54.5, 4.7, 6.51], [321, 44.9, -4.46, -1.43], None, None],
+    "KDJ近3日內死亡交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[2416, 54.9, 4.92, 6.96], [306, 44.1, -4.7, -1.32], None, [156, 53.8, 2.25, 0.36]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[3601, 54.3, 4.25, 7.46], [355, 43.4, -2.53, 1.1], [58, 72.4, 7.36, 1.92], [291, 56.4, 4.35, 0.8]],
+    "短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3637, 51.4, 3.06, 5.01], [452, 49.3, -0.92, -0.83], [61, 73.8, 5.57, -0.17], [322, 41.6, -2.88, -3.14]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3682, 52.3, 3.6, 6.3], [481, 46.2, -2.22, -0.81], [32, 75.0, 4.84, 0.02], [247, 49.8, 0.07, -0.88]],
+    "創52週新高 ＋ 爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%)": [[1019, 51.9, 4.16, 3.57], [128, 46.9, -1.13, -0.44], None, [88, 53.4, 0.31, -0.27]],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[11169, 52.3, 3.2, 7.82], None, [221, 67.0, 4.58, 1.25], None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%)": [[8286, 55.0, 4.55, 9.92], [766, 47.7, -1.3, -1.25], [150, 66.7, 5.74, 2.49], [552, 51.4, 1.11, -1.22]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[5816, 56.8, 5.31, 10.04], [549, 51.4, -0.08, -0.72], [46, 60.9, -2.17, -0.8], [357, 54.9, 2.7, 0.16]],
+    "大盤站上20日均線 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[11135, 52.4, 3.23, 7.84], None, [215, 67.0, 4.94, 1.4], None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[8281, 55.0, 4.55, 9.92], [766, 47.7, -1.3, -1.25], [148, 66.9, 5.95, 2.6], [552, 51.4, 1.11, -1.22]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[11135, 52.4, 3.23, 7.84], [1204, 45.8, -2.41, -1.51], [215, 67.0, 4.94, 1.4], [834, 47.5, -0.59, -3.57]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[9174, 52.8, 3.54, 8.42], None, [92, 69.6, 3.86, 0.43], None],
+    "布林通道收窄(寬度近半年最低20%) ＋ 近1季財報EPS低於預期 ＋ 近5日跌幅≥8%(短線超跌)": [[720, 48.1, 0.53, -0.99], [234, 39.3, -1.59, -0.09], None, [283, 63.3, 5.56, 1.89]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[113, 50.4, 6.12, 2.2], None, None, None],
+    "KDJ近3日內黃金交叉 ＋ 回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[1125, 52.3, 3.37, 2.97], [163, 41.7, -3.21, -0.98], None, [98, 43.9, -2.01, -1.06]],
+    "爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS大幅優於預期(≥10%)": [[1821, 53.7, 4.63, 5.19], [240, 46.7, -2.64, -1.73], [40, 82.5, 12.33, 3.7], [157, 45.2, -0.42, -0.56]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1233, 53.2, 5.27, 5.3], [142, 46.5, -2.12, -0.66], None, [101, 46.5, -3.33, -2.6]],
+    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位)": [[5299, 51.7, 3.7, 6.82], [682, 46.8, -1.44, -0.07], None, None],
+    "多方力道≥65 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[9753, 52.9, 3.56, 8.04], None, [121, 64.5, 1.38, 0.47], None],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[11003, 52.5, 3.3, 7.97], None, [210, 67.6, 5.23, 1.52], None],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[8242, 55.1, 4.61, 10.02], [764, 47.6, -1.29, -1.23], [147, 67.3, 6.09, 2.64], [550, 51.5, 1.14, -1.09]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[7436, 55.6, 4.83, 9.77], [674, 48.4, -0.39, -0.94], [119, 68.1, 5.17, 1.46], [458, 53.1, 1.66, -0.12]],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[4236, 52.2, 2.84, 4.98], None, [101, 72.3, 6.91, 1.01], None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[3143, 52.5, 3.22, 5.41], [288, 50.7, -0.02, 0.99], [40, 70.0, 7.26, 0.32], [205, 48.8, -0.03, 0.29]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[3071, 54.8, 4.36, 6.87], [204, 53.4, 1.18, 0.14], [65, 69.2, 4.4, 0.57], [212, 47.6, -1.04, -1.83]],
+    "短線過熱(高於月線≥20%)": [[11169, 52.3, 3.2, 7.82], [1206, 45.7, -2.47, -1.55], [221, 67.0, 4.58, 1.25], [839, 47.2, -0.74, -3.64]],
+    "大盤站上20日均線 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[10533, 52.2, 2.89, 7.0], None, [213, 68.1, 5.32, 1.64], None],
+    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 短線過熱(高於月線≥20%)": [[1382, 55.9, 4.35, 4.49], [177, 45.8, -1.88, -0.14], None, [107, 52.3, 0.59, 0.13]],
+    "大盤站上20日均線 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[11169, 52.3, 3.2, 7.82], None, None, None],
+    "大盤站上20日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[7158, 53.3, 3.25, 6.54], None, [149, 76.5, 9.76, 4.86], None],
+    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[11003, 52.5, 3.3, 7.97], [1190, 46.1, -2.31, -1.44], [210, 67.6, 5.23, 1.52], [825, 47.6, -0.49, -3.52]],
+    "母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[139, 51.1, 5.78, 2.37], None, None, None],
+    "母子懷抱(高檔)剛形成 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[140, 50.7, 5.49, 2.25], None, None, None],
+    "母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[141, 50.4, 5.39, 2.23], None, None, None],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 近20日強於大盤≥10% ＋ 近5日跌幅≥8%(短線超跌)": [[1053, 45.6, 0.82, 1.62], [330, 54.8, 1.04, 0.09], None, [425, 62.1, 4.64, 1.64]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[1287, 53.3, 5.06, 5.18], [167, 44.3, -1.61, 0.18], None, [100, 45.0, -2.89, -1.83]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1579, 53.3, 2.56, 2.31], [168, 60.7, 4.31, 2.25], None, [140, 40.7, -2.57, -2.7]],
+    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 近5日跌幅≥8%(短線超跌)": [[588, 54.9, 4.68, 3.25], [161, 63.4, 4.29, 1.45], None, None],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[846, 52.6, 3.72, 3.21], [99, 45.5, -2.71, -0.4], None, [63, 52.4, 3.66, 0.39]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[4815, 51.9, 3.22, 6.53], [580, 40.9, -4.19, 0.11], [87, 78.2, 9.42, 2.24], [400, 54.5, 3.15, -0.94]],
+    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2419, 51.6, 2.77, 3.27], [309, 49.2, -0.2, 0.94], [33, 75.8, 10.17, 2.22], [182, 47.3, 0.4, -0.38]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[4069, 53.4, 3.78, 6.22], [488, 42.4, -3.25, -0.03], [61, 73.8, 8.14, 1.18], [332, 53.6, 2.92, -0.84]],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%)": [[2480, 52.1, 3.27, 4.46], [287, 39.0, -3.96, -2.45], [41, 65.9, 8.6, 0.94], [195, 43.1, -1.56, -3.08]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[7515, 55.2, 4.74, 9.95], [701, 48.1, -1.09, -1.2], [79, 63.3, 1.93, -0.14], [475, 52.2, 1.47, -0.96]],
+    "回後買上漲全通過 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[2472, 52.1, 3.29, 4.51], [285, 38.6, -4.26, -2.96], [41, 65.9, 8.6, 0.94], [193, 43.0, -1.62, -3.07]],
+    "回後買上漲全通過 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[2473, 52.1, 3.28, 4.43], [287, 39.0, -3.96, -2.45], [39, 66.7, 9.5, 1.3], [193, 43.5, -1.33, -2.87]],
+    "大盤站上20日均線 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[9512, 53.6, 3.73, 8.07], None, [154, 64.3, 4.39, 0.81], None],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[3379, 52.9, 3.33, 5.26], [288, 52.4, 1.47, 1.25], [44, 68.2, 6.0, 1.24], [260, 46.5, -1.03, -1.0]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 距52週高點≤5%": [[1538, 55.5, 4.02, 4.44], [181, 48.6, -1.79, -0.61], None, [121, 50.4, 1.34, -0.27]],
+    "短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[4692, 51.8, 2.95, 5.38], [550, 48.7, -1.25, -0.3], [88, 79.5, 6.01, 0.65], [387, 42.4, -2.29, -3.31]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[6868, 54.5, 4.16, 8.96], [746, 49.6, -1.15, -0.45], [49, 63.3, -1.0, 0.43], [426, 52.3, 2.15, -0.96]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[7867, 54.6, 4.12, 8.75], [707, 47.0, -1.48, -1.84], [146, 66.4, 5.74, 2.4], [507, 50.9, 0.44, -1.64]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[4677, 51.8, 2.99, 5.43], [550, 48.7, -1.25, -0.3], [87, 79.3, 6.07, 0.67], [384, 42.7, -2.02, -3.26]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[4218, 52.3, 2.89, 5.03], [370, 51.1, 0.18, 1.12], [98, 71.4, 7.14, 1.06], [329, 46.2, -1.0, -1.33]],
+    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 近3日向上跳空缺口": [[4153, 52.6, 3.04, 5.08], [365, 51.0, 0.21, 1.15], [94, 72.3, 7.6, 1.04], [322, 46.3, -0.97, -1.31]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[6124, 54.9, 3.99, 6.89], [622, 48.6, -1.07, -1.03], [107, 72.0, 9.3, 3.36], [425, 49.6, 0.49, -1.33]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[5450, 56.0, 4.54, 8.14], [495, 50.1, -0.43, 0.9], [104, 74.0, 10.27, 3.47], [344, 50.9, 0.9, -0.7]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[7096, 55.2, 4.67, 9.76], [679, 47.3, -1.4, -0.82], [68, 69.1, 4.49, 0.4], [419, 55.1, 2.94, 1.46]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": [[4150, 54.2, 4.07, 6.87], [397, 47.6, -0.5, -0.32], [73, 65.8, 10.9, 2.18], [248, 56.0, 3.36, 1.58]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[10533, 52.2, 2.89, 7.0], [1118, 45.3, -2.7, -1.56], [213, 68.1, 5.32, 1.64], [757, 46.0, -1.52, -4.07]],
+    "短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[4236, 52.2, 2.84, 4.98], [370, 51.1, 0.18, 1.12], [101, 72.3, 6.91, 1.01], [331, 45.9, -1.11, -1.37]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[8579, 53.1, 3.71, 8.54], [949, 45.7, -2.32, -1.17], [73, 67.1, 1.62, 0.67], [541, 51.8, 1.5, -1.37]],
+    "多方力道≥80 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[6691, 55.2, 4.4, 8.09], [711, 49.9, -0.69, -0.76], [49, 55.1, -2.91, -1.44], [422, 51.7, 1.57, -1.7]],
+    "布林通道高檔(≥80%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[10504, 52.2, 2.92, 7.02], [1117, 45.4, -2.66, -1.54], [207, 68.1, 5.72, 1.82], [753, 46.2, -1.4, -3.98]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[4212, 52.1, 2.8, 5.04], [368, 50.8, 0.18, 1.09], [101, 72.3, 6.91, 1.01], [327, 45.3, -1.32, -1.44]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 近20日強於大盤≥10%": [[7078, 53.6, 3.34, 6.65], [744, 48.1, -2.02, -0.74], [143, 76.2, 10.19, 5.0], [517, 47.0, -0.57, -2.85]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[9174, 52.8, 3.54, 8.42], [1028, 45.4, -2.53, -1.1], [92, 69.6, 3.86, 0.43], [601, 51.6, 1.36, -1.66]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[10381, 52.4, 2.99, 7.16], [1103, 45.7, -2.56, -1.46], [202, 68.8, 6.04, 1.96], [745, 46.4, -1.3, -3.91]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[9168, 52.9, 3.56, 8.45], [1028, 45.4, -2.53, -1.1], [92, 69.6, 3.86, 0.43], [601, 51.6, 1.36, -1.66]],
+    "回後買上漲全通過 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[2480, 52.1, 3.27, 4.46], [287, 39.0, -3.96, -2.45], None, None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[5972, 54.3, 3.86, 7.02], [659, 47.3, -2.14, -0.71], [59, 72.9, 7.23, 1.3], [403, 48.9, 0.18, -1.32]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近1季財報EPS大幅優於預期(≥10%)": [[245, 44.5, 0.66, 0.78], [55, 58.2, 4.47, 0.77], None, [58, 69.0, 10.24, 1.58]],
+    "爆量(≥2倍均量) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1465, 51.7, 3.2, 3.59], [175, 53.1, 1.14, -0.01], [30, 76.7, 15.85, 1.89], [142, 43.7, -2.17, -2.23]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[4894, 51.6, 3.08, 6.27], [589, 40.4, -4.32, 0.1], [89, 77.5, 9.05, 2.12], [406, 53.9, 2.67, -1.14]],
+    "KDJ近3日內死亡交叉 ＋ 創52週新高 ＋ 短線過熱(高於月線≥20%)": [[725, 58.2, 5.99, 5.99], [96, 42.7, -5.39, -1.27], None, [46, 54.3, 3.0, 1.27]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[4885, 51.6, 3.13, 6.36], [589, 40.4, -4.32, 0.1], [88, 78.4, 9.47, 2.22], [402, 54.5, 3.0, -1.06]],
+    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[4681, 51.9, 3.52, 6.35], [591, 46.7, -1.92, -1.09], None, None],
+    "MACD近3日內黃金交叉 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[1021, 45.9, 0.32, 0.52], None, None, None],
+    "回後買上漲全通過 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[2087, 52.2, 3.41, 4.76], [245, 38.8, -3.5, -1.82], None, [154, 44.2, -0.83, -2.35]],
+    "多方力道≥80 ＋ 近20日強於大盤≥10% ＋ 近5日跌幅≥8%(短線超跌)": [[519, 55.7, 5.22, 3.21], [151, 61.6, 4.03, 1.3], None, [90, 52.2, 2.73, 0.24]],
+    "回後買上漲全通過 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[1475, 53.9, 3.89, 4.18], [163, 41.1, -3.25, -0.89], None, [109, 46.8, -0.52, -1.83]],
+    "短線過熱(高於月線≥20%) ＋ 量能區間高檔(≥90百分位) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3069, 51.2, 2.99, 4.26], [407, 50.1, -0.91, 0.46], [57, 75.4, 6.83, 0.96], [300, 40.3, -3.54, -3.28]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[8286, 55.0, 4.55, 9.92], [766, 47.7, -1.3, -1.25], None, None],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[9753, 52.9, 3.56, 8.04], [1073, 45.9, -2.29, -1.48], [121, 64.5, 1.38, 0.47], [692, 48.6, -0.21, -2.89]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[9512, 53.6, 3.73, 8.07], [1020, 46.9, -1.47, -1.1], [154, 64.3, 4.39, 0.81], [663, 48.9, -0.32, -3.44]],
+    "MACD近3日內黃金交叉 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[699, 47.5, 0.78, 0.53], [101, 55.4, 2.74, 1.43], None, [76, 46.1, -0.82, 0.3]],
+    "多方力道≥65 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[9744, 52.9, 3.57, 8.05], [1073, 45.9, -2.29, -1.48], [119, 64.7, 1.63, 0.5], [691, 48.6, -0.19, -2.88]],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[9689, 52.9, 3.59, 8.11], [1066, 46.2, -2.21, -1.41], [117, 65.0, 1.77, 0.49], [686, 48.7, -0.18, -2.9]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[9508, 53.6, 3.75, 8.1], [1020, 46.9, -1.47, -1.1], [154, 64.3, 4.39, 0.81], [660, 49.1, -0.18, -3.29]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[9478, 53.7, 3.79, 8.17], [1020, 46.9, -1.47, -1.1], [153, 64.7, 4.52, 0.9], [659, 49.2, -0.1, -3.23]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[7245, 54.7, 4.19, 8.28], [791, 49.7, -1.26, -0.9], [59, 61.0, -1.68, -1.15], [488, 50.4, 1.2, -2.31]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[7158, 53.3, 3.25, 6.54], [748, 47.9, -2.12, -0.83], [149, 76.5, 9.76, 4.86], [525, 46.7, -0.67, -2.9]],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[6286, 54.1, 3.66, 6.98], [671, 47.5, -2.13, -0.85], [82, 69.5, 5.76, 1.65], [440, 47.7, -0.04, -2.04]],
+    "多方力道≥80 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[7245, 54.7, 4.19, 8.28], [791, 49.7, -1.26, -0.9], [59, 61.0, -1.68, -1.15], [487, 50.5, 1.22, -2.3]],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[7237, 54.7, 4.2, 8.29], [791, 49.7, -1.26, -0.9], [59, 61.0, -1.68, -1.15], [485, 50.7, 1.23, -2.29]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[7146, 53.4, 3.26, 6.54], [748, 47.9, -2.12, -0.83], [146, 76.0, 9.99, 4.92], [523, 46.8, -0.6, -2.86]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[9122, 52.9, 3.59, 8.5], [1026, 45.3, -2.56, -1.11], [92, 69.6, 3.86, 0.43], [601, 51.6, 1.36, -1.66]],
+    "均線多頭排列(5>20>60且站上月線) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[8125, 53.8, 3.94, 8.62], [888, 46.3, -1.68, -0.83], [73, 65.8, 3.81, -0.16], [513, 51.3, 1.07, -1.68]],
+    "OBV能量潮創60日新高 ＋ 多方力道≥80 ＋ 短線過熱(高於月線≥20%)": [[3566, 54.2, 3.72, 6.23], [377, 47.5, -1.62, -0.58], [30, 50.0, -4.37, -1.15], [201, 53.2, 2.61, 1.33]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 夜星剛形成 ＋ 近1季財報EPS低於預期": [[130, 44.6, 1.02, 0.68], None, None, [32, 81.2, 12.18, 3.59]],
+    "布林通道高檔(≥80%) ＋ 母子懷抱(高檔)剛形成 ＋ 短線過熱(高於月線≥20%)": [[121, 52.9, 7.26, 2.67], None, None, None],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1746, 51.1, 3.87, 4.73], [151, 43.7, -1.34, 0.85], [52, 75.0, 9.93, 1.67], [135, 51.1, 2.64, 0.23]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[2045, 53.6, 3.42, 4.23], [263, 51.7, 0.52, 0.89], None, [168, 45.2, -2.32, -2.84]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ MACD近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%)": [[622, 50.5, 2.11, 1.93], [89, 51.7, 1.58, 1.15], None, [54, 57.4, 3.65, 1.01]],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[4603, 51.2, 2.8, 5.73], [537, 39.3, -4.77, 0.07], [86, 77.9, 9.48, 2.12], [357, 53.2, 1.5, -1.24]],
+    "KDJ近3日內黃金交叉 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[1245, 53.2, 2.93, 3.31], [195, 56.4, 1.74, 1.07], None, [113, 39.8, -3.93, -2.38]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 近3日向上跳空缺口": [[2841, 53.5, 3.22, 4.28], [247, 50.2, -0.81, -0.98], [67, 82.1, 10.84, 2.95], [219, 45.7, -2.52, -2.53]],
+    "多方力道≥65 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[8600, 53.7, 3.92, 8.09], [929, 46.7, -1.51, -1.01], [91, 59.3, 1.61, -0.57], [568, 50.2, 0.51, -2.55]],
+    "OBV能量潮創60日新高 ＋ 大盤站上20日均線 ＋ 短線過熱(高於月線≥20%)": [[5258, 52.6, 3.19, 5.52], None, [93, 66.7, 11.39, 2.39], None],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 近3日向上跳空缺口": [[1092, 52.8, 3.16, 2.92], [100, 45.0, -0.52, -0.57], None, [89, 40.4, -3.08, -2.39]],
+    "CMF資金流買方佔優(近20日≥0.1) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[2188, 54.1, 4.68, 5.48], [212, 44.3, -2.98, -1.71], [39, 43.6, -7.78, -2.16], [132, 56.1, 2.13, 0.03]],
+    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[11169, 52.3, 3.2, 7.82], [1206, 45.7, -2.47, -1.55], None, None],
+    "多方力道≥65 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3922, 52.3, 3.29, 5.16], [456, 49.8, -0.71, 0.03], [47, 83.0, 4.95, 1.12], [310, 43.9, -1.75, -2.65]],
+    "多方力道≥65 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[9753, 52.9, 3.56, 8.04], [1073, 45.9, -2.29, -1.48], None, None],
+    "多方力道≥80 ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[2650, 54.3, 4.21, 4.85], [308, 52.3, 0.05, 0.37], None, [184, 44.6, -0.49, -1.89]],
+    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[7245, 54.7, 4.19, 8.28], [791, 49.7, -1.26, -0.9], None, None],
+    "大盤站上60日均線 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[11135, 52.4, 3.23, 7.84], [1204, 45.8, -2.41, -1.51], None, None],
+    "多方力道≥65 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[9135, 52.7, 3.21, 7.21], [988, 45.5, -2.57, -1.48], [114, 66.7, 2.59, 0.48], [615, 47.3, -1.14, -3.47]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[6806, 53.2, 3.1, 5.96], [704, 47.9, -2.22, -1.22], [145, 76.6, 9.87, 4.86], [490, 45.7, -1.8, -3.77]],
+    "OBV能量潮創60日新高 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[5211, 52.7, 3.21, 5.46], [597, 45.1, -2.11, -0.53], [93, 66.7, 11.39, 2.39], [338, 52.4, 1.85, 0.18]],
+    "KDJ近3日內死亡交叉 ＋ 短線過熱(高於月線≥20%) ＋ 距52週高點≤5%": [[910, 59.7, 5.09, 5.51], [104, 44.2, -3.22, -1.63], None, [56, 57.1, 2.47, 1.02]],
+    "相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[3109, 51.8, 3.87, 5.22], [345, 42.9, -3.8, -2.74], [54, 44.4, -6.34, -2.09], [204, 52.5, 0.03, -1.65]],
+    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[11003, 52.5, 3.3, 7.97], [1190, 46.1, -2.31, -1.44], None, None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 大盤站上60日均線 ＋ 短線過熱(高於月線≥20%)": [[9174, 52.8, 3.54, 8.42], [1028, 45.4, -2.53, -1.1], None, None],
+    "半年強勢(6-1月勝大盤≥10%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 近5日跌幅≥8%(短線超跌)": [[1128, 47.1, 0.21, 0.95], [326, 60.1, 3.72, 1.54], None, [353, 64.0, 4.26, 1.86]],
+    "OBV能量潮創60日新高 ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[4977, 52.8, 3.27, 5.6], [573, 45.5, -1.9, -0.67], [83, 65.1, 10.07, 1.88], [321, 52.0, 2.01, 0.15]],
+    "OBV能量潮創60日新高 ＋ 多方力道≥65 ＋ 短線過熱(高於月線≥20%)": [[4691, 52.3, 3.22, 5.58], [536, 45.1, -1.71, -0.39], [58, 60.3, 5.04, 0.72], [282, 53.5, 3.05, 1.08]],
+    "大盤站上60日均線 ＋ 短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期": [[7158, 53.3, 3.25, 6.54], [748, 47.9, -2.12, -0.83], None, None],
+    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 近5日跌幅≥8%(短線超跌)": [[588, 54.9, 4.68, 3.25], None, None, None],
+    "均線多頭排列(5>20>60且站上月線) ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[8566, 52.7, 3.19, 7.51], [942, 45.0, -2.8, -1.11], [90, 70.0, 3.91, 0.41], [529, 50.9, 0.45, -1.62]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS優於預期 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3069, 52.7, 2.84, 4.97], [372, 50.8, -1.25, -1.49], [60, 90.0, 10.11, 4.43], [249, 41.0, -2.28, -1.95]],
+    "大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成 ＋ 近3日向上跳空缺口": [None, None, None, [144, 70.1, 6.85, 1.15]],
+    "回後買上漲全通過 ＋ 短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10%": [[2446, 52.3, 3.35, 4.48], [283, 38.9, -3.95, -2.43], [38, 65.8, 9.37, 1.36], [191, 44.0, -1.29, -2.84]],
+    "MACD近3日內黃金交叉 ＋ 爆量(≥1.5倍均量) ＋ 短線過熱(高於月線≥20%)": [[665, 47.4, 0.88, 0.25], [115, 52.2, 0.25, 0.92], None, [77, 50.6, -0.63, 0.26]],
+    "布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[4650, 51.8, 2.98, 5.39], [542, 49.3, -1.04, -0.2], [88, 79.5, 6.01, 0.65], [382, 42.9, -2.02, -3.01]],
+    "OBV能量潮創60日新高 ＋ 相對強弱為正(強於大盤) ＋ 短線過熱(高於月線≥20%)": [[5248, 52.6, 3.19, 5.54], [604, 45.2, -2.08, -0.47], [92, 66.3, 11.55, 2.43], [340, 52.9, 2.22, 0.47]],
+    "短線過熱(高於月線≥20%) ＋ 近20日強於大盤≥10% ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[4610, 52.0, 3.09, 5.51], [541, 49.0, -1.16, -0.28], [84, 79.8, 6.29, 0.82], [378, 42.9, -1.88, -3.23]],
+    "漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": [[3969, 52.8, 3.46, 5.49], [456, 51.1, 0.34, 0.06], [71, 77.5, 5.89, 0.38], [295, 43.1, -1.91, -3.18]],
+    "短線過熱(高於月線≥20%) ＋ 近1季財報EPS低於預期": [[3122, 51.8, 3.88, 5.23], [345, 42.9, -3.8, -2.74], [56, 42.9, -6.92, -2.1], [204, 52.5, 0.03, -1.65]],
+    "OBV能量潮創60日新高 ＋ 短線過熱(高於月線≥20%)": [[5258, 52.6, 3.19, 5.52], [604, 45.2, -2.08, -0.47], [93, 66.7, 11.39, 2.39], [342, 52.6, 1.96, 0.1]],
+    "強勢突破盤 ＋ 短線過熱(高於月線≥20%) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": [[3509, 51.7, 2.92, 5.23], [425, 49.2, -0.86, -0.08], [55, 74.5, 2.39, 0.09], [299, 47.5, -0.32, -1.25]],
+    "布林通道高檔(≥80%) ＋ 漲時量≥跌時量1.5倍(近20日) ＋ 短線過熱(高於月線≥20%)": [[8942, 53.5, 3.44, 7.37], [947, 46.3, -1.9, -1.25], [147, 66.0, 5.51, 1.4], [594, 47.3, -1.21, -3.79]],
+    "大盤站上60日均線 ＋ 布林通道高檔(≥80%) ＋ 短線過熱(高於月線≥20%)": [[10533, 52.2, 2.89, 7.0], [1118, 45.3, -2.7, -1.56], None, None],
+    "回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[1987, 52.1, 3.15, 3.99], [241, 37.3, -4.21, -1.86], None, [141, 48.2, -0.28, -1.46]],
+    "OBV能量潮創60日新高 ＋ 半年強勢(6-1月勝大盤≥10%) ＋ 短線過熱(高於月線≥20%)": [[2405, 51.9, 3.15, 3.07], [288, 40.3, -4.19, 0.77], [45, 77.8, 17.06, 2.63], [178, 59.0, 5.29, 1.69]],
+    "OBV能量潮創60日新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 短線過熱(高於月線≥20%)": [[4634, 52.4, 3.32, 5.8], [529, 44.2, -2.38, -0.32], [50, 60.0, 2.12, -0.02], [276, 55.1, 3.16, 1.36]],
+    "中期強勢(12-1月勝大盤≥20%) ＋ 目標價上檔空間≥40%": [[2953, 46.2, 0.15, 2.09], [1099, 52.4, 2.45, 3.76], [100, 71.0, 2.32, 2.91], [1260, 62.7, 3.39, 5.63]],
+    "毛利率年增≥2pp(最新季) ＋ 近1季財報EPS大幅優於預期(≥10%) ＋ 高Beta(>1.5)": [[10032, 52.4, 1.28, 5.99], [1790, 54.7, 1.38, 2.52], [254, 65.4, 6.23, 4.6], [2077, 59.6, 4.07, 6.75]],
 }
 
 
